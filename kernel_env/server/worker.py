@@ -24,7 +24,7 @@ import traceback
 
 try:
     from .validation_memory import input_fingerprint, paired_tensor_chunks, tensor_chunks, max_abs_error, CHUNK_BYTES
-    from .benchmark_protocol import paired_timings, cuda_coverage
+    from .benchmark_protocol import paired_timings, cuda_coverage, generated_replay_profile
     from .cuda_graph_timing import capture_work, measure_work, input_batches, checked_measure, checked_eager_warmup, prepare_check, finish_check, check_outputs, calibrated_floor, tensor_bytes, graph_repeats, graph_memory_plan, cuda_memory_evidence, MEASUREMENT_SCOPE, METHOD as GRAPH_METHOD
 except ImportError:
     import runpy
@@ -33,7 +33,7 @@ except ImportError:
     input_fingerprint, paired_tensor_chunks, tensor_chunks, max_abs_error = (_memory_helpers[name] for name in ('input_fingerprint','paired_tensor_chunks','tensor_chunks','max_abs_error'))
     CHUNK_BYTES=_memory_helpers['CHUNK_BYTES']
     _benchmark_helpers = runpy.run_path(str(Path(__file__).with_name("benchmark_protocol.py")))
-    paired_timings, cuda_coverage = _benchmark_helpers["paired_timings"], _benchmark_helpers["cuda_coverage"]
+    paired_timings, cuda_coverage, generated_replay_profile = _benchmark_helpers["paired_timings"], _benchmark_helpers["cuda_coverage"], _benchmark_helpers["generated_replay_profile"]
     _graph_helpers = runpy.run_path(str(Path(__file__).with_name("cuda_graph_timing.py")))
     capture_work, measure_work, input_batches, checked_measure, checked_eager_warmup, prepare_check, finish_check, check_outputs, calibrated_floor = (_graph_helpers[name] for name in ('capture_work','measure_work','input_batches','checked_measure','checked_eager_warmup','prepare_check','finish_check','check_outputs','calibrated_floor'))
     GRAPH_METHOD = _graph_helpers['METHOD']
@@ -56,7 +56,7 @@ class HostOperationError(RuntimeError):
     pass
 
 
-def kernel_only_mode(device_type="cuda"):
+def kernel_only_mode(device_type="cuda", hybrid=None, task_id=""):
     """Catch tensor operators that AST checks cannot distinguish from scalar/shape arithmetic.
 
     This checks PyTorch dispatch inside forward, not arbitrary native code or graphs built in __init__.
@@ -66,6 +66,12 @@ def kernel_only_mode(device_type="cuda"):
     from torch.utils._python_dispatch import TorchDispatchMode
     from torch.utils._pytree import tree_leaves
     import torch
+    import os
+    if hybrid is None:
+        hybrid = os.environ.get("KERNEL_ENV_CONTRACT", "strict") == "hybrid" and task_id.startswith("level2/")
+    # What F.linear/F.conv*/torch.matmul lower to below autograd; fp32 only, so a library call cannot
+    # buy speed by silently dropping to half precision.
+    library = {"mm", "addmm", "bmm", "baddbmm", "convolution"} if hybrid else set()
 
     allowed = {
         "empty", "empty_like", "empty_strided", "new_empty", "new_empty_strided",
@@ -86,7 +92,11 @@ def kernel_only_mode(device_type="cuda"):
                 off_device = (name == "_to_copy" and kwargs.get("device") is not None
                               and torch.device(kwargs["device"]).type != device_type)
                 off_device |= name == "copy_" and args[0].device.type != device_type
-                if name not in allowed or off_device:
+                if name.split(".")[0] in library:
+                    if any(isinstance(x, torch.Tensor) and x.dtype in (torch.float16, torch.bfloat16)
+                           for x in tree_leaves((args, kwargs))):
+                        raise HostOperationError(f"Reduced-precision library call '{func}'; keep the reference dtype")
+                elif name not in allowed or off_device:
                     raise HostOperationError(f"PyTorch operation '{func}' in forward; use a custom kernel")
             return func(*args, **kwargs)
 
@@ -281,11 +291,10 @@ def evaluate(req: dict) -> dict:
             # Actual graph replay must contain generated CUDA work; all checks remain outside events.
             fresh=[adversarial_inputs(torch,make_inputs(seeds[0]+i*65537),req.get('task_id',''),i%len(seeds)) for i in range(generated.repeats)]
             expected,before=prepare_check(torch,generated,fresh,ref,fingerprint)
-            replay_profile=profile(generated.replay,[],names)
+            # Re-replaying the same inputs rewrites identical outputs, so finish_check still covers every attempt.
+            replay_profile=generated_replay_profile(lambda:profile(generated.replay,[],names))
             finish_check(torch,generated,expected,before,fingerprint,error)
             del fresh,expected
-            if replay_profile['generated_cuda_fraction']<=0:
-                raise HostOperationError('No generated CUDA work in captured replay')
             floor,calibration=calibrated_floor(torch,generated,dev)
             measurement=paired_timings(lambda:validated(reference),lambda:validated(generated),
                                       seeds[0],absolute_floor_ms=floor)
@@ -369,7 +378,7 @@ def _evaluate_candidate(req, torch, dev, ref, init_inputs, make_inputs, bench, o
     except BaseException as e:
         return {**out, "stage": _stage_for(e), "feedback": _tb()}
 
-    guard = kernel_only_mode(dev.type)
+    guard = kernel_only_mode(dev.type, task_id=req.get('task_id', ''))
 
     def candidate(*inputs):
         with guard:

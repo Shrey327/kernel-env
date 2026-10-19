@@ -2,7 +2,7 @@
 import argparse,json,subprocess,sys,time,threading
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).parent/'train'))
-from corrected_contract import RUN,digest,source_files,require_gate
+from corrected_contract import RUN,BUDGET_RUN,digest,source_files,require_gate
 from spend_guard import SpendGuard
 
 
@@ -64,10 +64,10 @@ def main():
     gates=json.loads(Path(args.gates).read_text()) if args.gates else {}
     check_launch(args.phase,contract,local,gates)
     ledger=json.loads(Path(args.ledger).read_text())
-    if ledger.get('new_run_id')!=RUN or ledger.get('authorization_baseline_utc')!='2026-10-19T16:01:11Z':raise ValueError('wrong fresh budget ledger')
-    envelope,seconds={'validate':('validation',1800),'pilot':('pilot',1800),'train':('training',9000),
+    if ledger.get('new_run_id')!=BUDGET_RUN or ledger.get('authorization_baseline_utc')!='2026-10-19T16:01:11Z':raise ValueError('wrong fresh budget ledger')
+    envelope,seconds={'validate':('validation',3000),'pilot':('pilot',1800),'train':('training',9000),
         'eval-base':('evaluation',3600),'eval-sft':('evaluation',3600),'eval-rl':('evaluation',3600)}[args.phase]
-    guard=SpendGuard(args.ledger);reservation=guard.reserve('corrected-'+args.phase,envelope,seconds)
+    guard=SpendGuard(args.ledger);reservation=guard.reserve('corrected-'+args.phase,envelope,seconds,gpus=1 if args.phase=='validate' else 2)  # matches modal_corrected gpu=
     guard.record(reservation['reservation_id'],source_digest=contract['source_digest'],protocol_digest=contract['protocol_digest'],run_id=RUN)
     print(json.dumps({'reserved':reservation}),flush=True)
     from modal_corrected import app,validate,stage

@@ -8,6 +8,7 @@ be distinguished from legitimate scalar/shape arithmetic.
 """
 
 import ast
+import os
 from typing import Dict, List, Optional, Tuple
 
 ALLOWED_IMPORTS = {"torch", "triton", "math", "typing", "functools"}
@@ -35,6 +36,15 @@ TENSOR_COMPUTE = {
     "masked_fill", "where", "gather", "scatter", "index_select", "logsumexp", "outer", "dot",
 }
 KERNEL_DECORATORS = {"triton.jit", "triton.autotune", "triton.heuristics"}
+# Hybrid contract: vendor GEMM/convolution calls may stay in host code; all other compute must be custom.
+LIBRARY_CALLS = {"torch.matmul", "torch.mm", "torch.bmm", "torch.conv1d", "torch.conv2d", "torch.conv3d",
+                 *("torch.nn.functional." + n for n in ("linear", "conv1d", "conv2d", "conv3d",
+                                                        "conv_transpose1d", "conv_transpose2d", "conv_transpose3d"))}
+
+
+def hybrid_contract(task_id: str = "") -> bool:
+    # Level-1 tasks stay kernel-only: a library call would make their matmul tasks trivially "correct".
+    return os.environ.get("KERNEL_ENV_CONTRACT", "strict") == "hybrid" and task_id.startswith("level2/")
 
 
 def _path(node: ast.AST, aliases: Dict[str, str]) -> Tuple[Optional[str], bool]:
@@ -62,7 +72,7 @@ def _is_kernel(fn: ast.FunctionDef, aliases: Dict[str, str]) -> bool:
     return False
 
 
-def check_source(code: str, language: str = "triton") -> List[str]:
+def check_source(code: str, language: str = "triton", task_id: str = "") -> List[str]:
     """Return a list of violations; empty list means the source may be executed."""
     try:
         tree = ast.parse(code)
@@ -71,6 +81,7 @@ def check_source(code: str, language: str = "triton") -> List[str]:
 
     errors: List[str] = []
     aliases: Dict[str, str] = {}
+    library = LIBRARY_CALLS if hybrid_contract(task_id) else set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
@@ -151,7 +162,7 @@ def check_source(code: str, language: str = "triton") -> List[str]:
         p, root_is_import = _path(n.func, aliases)
         if p is None:
             continue
-        if p.startswith("torch.") and p not in TORCH_ALLOWED and not p.startswith(
+        if p.startswith("torch.") and p not in TORCH_ALLOWED and p not in library and not p.startswith(
             ("torch.cuda.", "torch.utils.cpp_extension.")
         ):
             errors.append(f"PyTorch op '{p}' in host code (line {n.lineno}); use a custom kernel")

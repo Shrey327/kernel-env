@@ -6,25 +6,28 @@ from better_campaign import materialize_model,train_command as old_train_command
 from campaign import read_episodes,compare_paired
 
 
-def train_command(base,tasks,out,steps,deadline,contract):
+def train_command(base,tasks,out,steps,deadline,contract,generations=4,episodes=8):
     cmd=old_train_command(base,tasks,out,steps,42,0,deadline)
     cmd[cmd.index('--gamma')+1]='1.0'
+    if episodes%4 or episodes%generations:raise ValueError('episodes per update must be whole groups and whole micro-batches of 4')
+    cmd[cmd.index('--num_generations')+1]=str(generations)
+    cmd[cmd.index('--gradient_accumulation_steps')+1]=str(episodes//4)
     return cmd+['--calibrated_progress_returns','true','--protocol_manifest',str(contract),'--multi_objective_aggregation','sum_then_normalize','--beta','0.0']
 
 
 def completion(actual,target):return {'completed':actual==target,'actual_steps':actual,'target_steps':target}
 
 
-def pilot_gate(episodes,metrics,noise_std):
+def pilot_gate(episodes,metrics,noise_std,group_size=4):
     if not isinstance(noise_std,(int,float)) or not math.isfinite(noise_std) or noise_std<0:
         raise ValueError('measured finite fast-code reward noise is required')
     if any(e.get('error') or any(t.get('stage')=='infrastructure' for t in e['turns']) for e in episodes):
         raise ValueError('pilot infrastructure failure')
     faster=[e for e in episodes if any(t.get('correct') and (t.get('speedup_lower_bound') or 0)>1 for t in e['turns'])]
     separated=0
-    for start in range(0,len(episodes),4):
-        group=episodes[start:start+4]
-        if len(group)!=4 or len({e['task_id'] for e in group})!=1:raise ValueError('pilot incomplete or mixed group')
+    for start in range(0,len(episodes),group_size):
+        group=episodes[start:start+group_size]
+        if len(group)!=group_size or len({e['task_id'] for e in group})!=1:raise ValueError('pilot incomplete or mixed group')
         correct=[]
         for ep in group:
             good=[t for t in ep['turns'] if t.get('correct')]
@@ -61,15 +64,15 @@ def main():
         steps=4 if a.phase=='pilot' else 32
         target=out/'adapter' if a.phase=='pilot' else root/'experiment/seed42/adapter'
         if target.exists():raise RuntimeError('preserve existing corrected adapter; no automatic resume')
-        tasks=out/'train_tasks.json';tasks.write_text(json.dumps(protocol['curriculum']))
+        tasks=out/'train_tasks.json';tasks.write_text(json.dumps(protocol['training_tasks']))
         base=materialize_model(root)
-        seconds=run(train_command(base,tasks,target,steps,a.deadline,Path(a.contract)),out/'train.log',a.deadline)
+        seconds=run(train_command(base,tasks,target,steps,a.deadline,Path(a.contract),protocol['generations'],protocol['episodes_per_update']),out/'train.log',a.deadline)
         state=json.loads((target/'live_trainer_state.json').read_text());result=completion(state['global_step'],steps)
         result.update(seconds=seconds,source_digest=c['source_digest'],protocol_digest=c['protocol_digest'])
         if a.phase=='pilot':
             episodes=read_episodes(target/'rollouts-rank0.jsonl');metrics=[m for m in state['log_history'] if 'rollout/wall_seconds' in m]
             noise=gates['reward-calibration'].get('fast_code_reward_std')
-            result.update(pilot_gate(episodes,metrics,noise));result['passed']=result['passed'] and result['completed']
+            result.update(pilot_gate(episodes,metrics,noise,protocol['generations']));result['passed']=result['passed'] and result['completed']
         else:result['passed']=result['completed']
         (out/'result.json').write_text(json.dumps(result,indent=2));return
     arm=a.phase.removeprefix('eval-')

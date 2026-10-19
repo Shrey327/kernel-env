@@ -2,7 +2,9 @@
 import hashlib,json
 from pathlib import Path
 
-RUN='corrected-20261019'
+RUN='fusion-20261020'
+BUDGET_RUN='corrected-20261019'  # the authorized spend ledger this experiment draws from
+ENV_FLAGS={'KERNEL_ENV_CONTRACT':'hybrid','KERNEL_ENV_FEWSHOT':'1'}
 BASE='Qwen/Qwen2.5-Coder-7B-Instruct'
 REVISION='c03e6d358207e414f1eca0bb1891e29f1db0e242'
 from kernel_env.server.cuda_graph_timing import METHOD
@@ -36,7 +38,8 @@ def require_gate(gate,contract,stage):
 
 
 def protocol(sft):
-    from better_protocol import CURRICULUM,variant_source,TRAINING_SHAPES,TRAINING_VARIANT
+    from better_protocol import CURRICULUM,FUSION_CURRICULUM,variant_source,TRAINING_SHAPES,TRAINING_VARIANT
+    from kernel_env.server import fewshot
     from kernel_env.server.tasks import load_tasks
     tasks=load_tasks()
     from campaign import DIAGNOSTIC,RESERVED,EXCLUDED
@@ -44,20 +47,26 @@ def protocol(sft):
        'measurement':'Amortized CUDA graph replay event interval, with unsubtracted launch/submission/idle overhead; host guard/allocation/validation/profiling outside event calls; captured GPU copies included. Not pure kernel time.',
        'warmup':'1validated eager call per arm before capture;3validated graph replays per arm before first timed sample;3null graph warmups/canary checks before7null samples; no measured samples discarded; evidence retained separately; synthetic1.1x sensitivity checked for every fixed replicate',
        'graph_policy':'Fixed512MiB independent input-storage target; repeats=max(1,min(64,floor(512MiB/input_bytes))); full live-memory admission cap64GiB with8GiB device reserve and256MiB comparison scratch allowance; fail rather than adapt repeat count; every timed replay checked; no alternate timer',
-       'uncertainty':'max(2%median, observed range, calibrated null launch and0.5us/event divided by repeat count); no subtraction; engineering bounds',
-       'curriculum':CURRICULUM,'training_shapes':TRAINING_SHAPES,'training_variant':TRAINING_VARIANT,
+       'uncertainty':'7 fresh paired rounds; band max(2%median, interquartile range, calibrated null launch and0.5us/event divided by repeat count); no subtraction; engineering bounds',
+       'curriculum':CURRICULUM,'fusion_curriculum':FUSION_CURRICULUM,'training_tasks':CURRICULUM+FUSION_CURRICULUM,
+       'training_shapes':TRAINING_SHAPES,'training_variant':TRAINING_VARIANT,'env':ENV_FLAGS,
+       'contract_policy':'Level 1 kernel-only. Level 2 hybrid: vendor matmul/mm/bmm/linear/conv/conv_transpose allowed in host code in the reference dtype (fp16/bf16 library calls rejected); all other compute in executed custom kernels; every cheat check unchanged.',
+       'few_shot':{'policy':'one fixed disjoint training-split worked example per contract level, in the user prompt for training and every evaluation arm; never in completions or loss; never credited as model output',
+                   'examples':{str(level):{'task':tid,'reference_sha256':hashlib.sha256(ref.encode()).hexdigest(),'solution_sha256':hashlib.sha256(sol.encode()).hexdigest()}
+                               for level,(tid,ref,sol) in fewshot.EXAMPLES.items()}},
        'shape_rationale':'Training activations/reductions32MiB and losses32MiB total inputs;512MiB graph input storage amortizes launch uncertainty and exceeds H100 cache capacity.32/64MiB variants reverified, matmul1024/1536. Shapes fixed before empirical measurements; no selection based on favorable results.',
        'sft_shape_provenance':'Reuse exact clean12-step SFT artifact trained on prior small shapes; no new SFT updates. Saved SFT dataset hash remains unchanged. Reverify all28 handwritten teachers separately on the new fixed32/64MiB variants before pilot.',
        'sensitivity':'All3 fixed identity-control replicates at each required new32/64MiB regime must resolve synthetic1.1x. Old2MiB control is retained as a diagnostic of the known insensitive regime, excluded from training. Synthetic ratios are not achieved speedups.',
        'validation_policy':'Predeclared required cases; collect independent outcomes after ordinary failure while GPU healthy and deadline allows; retain all samples and failures; any required failed/not-run case fails overall gate. No automatic retry or outlier rejection.',
        'stream_policy':'Candidate eager and captured replay profiles must show exactly one CUDA device/stream; missing stream evidence or additional streams are rejected.',
-       'validation_seconds':1800,'original_shape_eval_timeout_seconds':600,'validation_no_progress_seconds':660,
+       'validation_seconds':3000,'original_shape_eval_timeout_seconds':600,'validation_no_progress_seconds':660,
        'evaluation_shapes':'original pinned KernelBench shapes; Softsign4096x393216 float32=6GiB',
-       'evaluation_groups':{'training_diagnostic':DIAGNOSTIC,'reserved_transfer':RESERVED,'official_heldout':sorted(k for k,t in tasks.items() if t.level==1 and t.split=='eval' and k not in EXCLUDED)},
+       'evaluation_groups':{'training_diagnostic':DIAGNOSTIC,'reserved_transfer':RESERVED,'official_heldout':sorted(k for k,t in tasks.items() if t.level==1 and t.split=='eval' and k not in EXCLUDED),
+                            'official_heldout_level2':sorted(k for k,t in tasks.items() if t.level==2 and t.split=='eval')},
        'task_sources_sha256':{tid:hashlib.sha256(task.src.encode()).hexdigest() for tid,task in tasks.items()},
        'training_variant_sha256':{tid+'/'+str(v):hashlib.sha256(variant_source(tasks[tid],v).encode()).hexdigest() for tid in CURRICULUM for v in (0,1)},
        'excluded':sorted(EXCLUDED),'evaluation_samples':1,'evaluation_temperature':.7,'evaluation_seed':1729,
-       'training_steps':32,'episodes_per_update':8,'generations':4,'attempts':3,'gamma':1.0,
+       'training_steps':32,'episodes_per_update':16,'generations':8,'attempts':3,'gamma':1.0,
        'credit':'independent trajectory returns; N/(N-1) trajectory LOO; synchronous optimizer barrier; not turn-levelTRLOO',
        'reward':'corrected-speed-progress-v2: invalid0; correct0.25+clip(log2(conservative speedup),0,2); best validated quality within3attempts; telescoping progress credits; gamma1',
        'training_temperature':.8,'max_new_tokens':1536,'context_length':12288,'sampling':'vLLM colocated,35percent memory, synchronous; no overlap sampler',

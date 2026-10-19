@@ -69,7 +69,32 @@ def build_prompt(task: Task, language: str = "triton", max_turns: int = 4) -> st
     if task.task_id in REGRESSION_LOSSES:
         prompt += '\nCorrectness also checks identical prediction/target tensors and zero predictions with target 2 at the original shape; timing uses the original generator.'
     prompt += '\nCandidate CUDA work must use a single stream; side-stream work is rejected.'
+    if os.environ.get("KERNEL_ENV_CONTRACT", "strict") == "hybrid" and task.level == 2:
+        prompt = prompt.replace(STRICT_RULES, HYBRID_RULES)
+    from . import fewshot
+    if fewshot.enabled() and ANSWER_MARKER in prompt:
+        prompt = prompt.replace(ANSWER_MARKER, fewshot.block(task.level) + ANSWER_MARKER, 1)
     return prompt
+
+
+ANSWER_MARKER = "\n\nAnswer with one ```python block"
+
+
+STRICT_RULES = """2. All math runs inside `@triton.jit` kernels. In `forward` and helpers you may only allocate outputs
+   (torch.empty, torch.empty_like, torch.zeros), call .contiguous()/.view()/.reshape(), read .shape/.stride(),
+   and launch kernels.
+3. Never call PyTorch compute outside kernels: no torch.matmul, torch.relu, torch.softmax, torch.sum, etc.,
+   no torch.nn.functional (F.*), no `@`, no tensor methods like x.sum() or x.clamp(), and never call a layer
+   such as self.conv(x) or self.linear(x). To use a layer's weights, pass self.conv.weight and
+   self.conv.bias to your kernel."""
+HYBRID_RULES = """2. Matrix multiplies and convolutions may use the vendor library: torch.matmul, torch.mm, torch.bmm,
+   F.linear, F.conv1d/2d/3d and F.conv_transpose1d/2d/3d, in the reference dtype (no casting to half/bf16).
+   Pass layer weights explicitly, e.g. F.conv2d(x, self.conv.weight, self.conv.bias, ...).
+   All other math (activations, normalization, reductions, elementwise chains) runs in `@triton.jit`
+   kernels; fusing it into as few kernels as possible is where the speedup comes from.
+3. Apart from those library calls: no other torch compute, no other F.* calls, no `@`, no tensor methods
+   like x.sum() or x.clamp(), and never call a layer such as self.conv(x) or self.linear(x). A submission
+   with no executed custom kernel is rejected; one only as fast as the reference earns no speed bonus."""
 
 
 def _prompt_v1(task: Task, language: str, max_turns: int) -> str:

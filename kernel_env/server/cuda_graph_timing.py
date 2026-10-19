@@ -2,7 +2,7 @@
 import statistics,time,hashlib
 from dataclasses import dataclass,field
 
-METHOD='fresh_paired_cuda_graph_event_interval_v4'
+METHOD='fresh_paired_cuda_graph_event_interval_v5'
 MEASUREMENT_SCOPE='amortized CUDA graph replay event interval with unsubtracted launch overhead; host validation/guards outside events; captured GPU copies included'
 GRAPH_INPUT_TARGET_BYTES=512*1024**2
 LIVE_MEMORY_CAP_BYTES=64*1024**3

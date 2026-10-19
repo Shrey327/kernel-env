@@ -1,6 +1,6 @@
 import pytest
 
-from kernel_env.server.benchmark_protocol import paired_timings, cuda_coverage
+from kernel_env.server.benchmark_protocol import paired_timings, cuda_coverage, generated_replay_profile
 from types import SimpleNamespace
 
 
@@ -9,8 +9,8 @@ def test_fresh_paired_timings_randomize_order_and_include_both_uncertainties():
     def ref():order.append('ref');return 10.
     def candidate():order.append('candidate');return 5.
     result=paired_timings(ref,candidate,seed=1)
-    assert order.count('ref') == order.count('candidate') == 3
-    assert all(set(order[i:i+2]) == {'ref','candidate'} for i in (0,2,4))
+    assert order.count('ref') == order.count('candidate') == 7
+    assert all(set(order[i:i+2]) == {'ref','candidate'} for i in range(0,14,2))
     assert result['speedup'] == 2
     assert result['speedup_lower_bound'] == pytest.approx(9.8/5.1)
     assert result['speedup_upper_bound'] == pytest.approx(10.2/4.9)
@@ -19,7 +19,7 @@ def test_fresh_paired_timings_randomize_order_and_include_both_uncertainties():
 def test_near_parity_and_unstable_measurements_do_not_claim_clear_speedup():
     result=paired_timings(lambda:4.27,lambda:4.26)
     assert result['speedup_lower_bound'] < 1 < result['speedup_upper_bound']
-    values=iter([3.,5.,4.])
+    values=iter([3.,5.,4.]*3)
     result=paired_timings(lambda:4.27,lambda:next(values))
     assert result['speedup_lower_bound'] < 1
 
@@ -60,3 +60,32 @@ def test_calibrated_graph_floor_preserves_resolvable_microsecond_gain():
     assert result['speedup_lower_bound']>1.
     noisy=paired_timings(lambda:.002,lambda:.001,absolute_floor_ms=.001)
     assert noisy['speedup_lower_bound']<1<noisy['speedup_upper_bound']
+
+
+def _summary(fraction,total,kernels):
+    return {'generated_cuda_fraction':fraction,'cuda_time_us':total,'top_kernels':kernels}
+
+
+def test_dropped_replay_trace_is_retried_but_still_needs_generated_work():
+    runs=iter([_summary(0.,0.,[]),_summary(1.,200.,[('loss_partial_kernel',150.,True)])])
+    assert generated_replay_profile(lambda:next(runs))['profile_attempts']==2
+    with pytest.raises(ValueError,match='No generated CUDA work'):
+        generated_replay_profile(lambda:_summary(0.,0.,[]))
+
+
+def test_replay_with_only_non_generated_work_is_rejected_without_retry():
+    calls=[]
+    def run():calls.append(1);return _summary(0.,50.,[('spin_kernel',50.,False)])
+    with pytest.raises(ValueError,match='spin_kernel'):generated_replay_profile(run)
+    assert len(calls)==1
+
+
+def test_one_interference_spike_does_not_move_the_conservative_bound():
+    clean=paired_timings(lambda:.0868,lambda:.0278,absolute_floor_ms=.0007)
+    spikes=iter([.0278]*6+[.0290])
+    spiked=paired_timings(lambda:.0868,lambda:next(spikes),absolute_floor_ms=.0007)
+    assert spiked['speedup_lower_bound']==pytest.approx(clean['speedup_lower_bound'])
+
+
+def test_too_few_rounds_for_an_interquartile_band_fail_closed():
+    with pytest.raises(ValueError,match='five paired rounds'):paired_timings(lambda:1.,lambda:1.,rounds=3)

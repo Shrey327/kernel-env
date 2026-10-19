@@ -37,7 +37,7 @@ def test_recovery_protocol_pins_shapes_sft_identity_and_unsubtracted_timer():
     from kernel_env.server.cuda_graph_timing import METHOD
     if not os.environ.get('KERNELBENCH_DIR'):pytest.skip('pinned KernelBench source required')
     value=protocol({'adapter_sha256':'saved-adapter','examples_sha256':'saved-original-dataset'})
-    assert value['timing_method']==METHOD=='fresh_paired_cuda_graph_event_interval_v4'
+    assert value['timing_method']==METHOD=='fresh_paired_cuda_graph_event_interval_v5'
     assert 'unsubtracted' in value['measurement'] and 'Not pure kernel time' in value['measurement']
     assert value['training_shapes']==TRAINING_SHAPES and value['training_variant']==TRAINING_VARIANT==0
     assert value['sft_sha256']=='saved-adapter' and value['teacher_dataset_sha256']=='saved-original-dataset'

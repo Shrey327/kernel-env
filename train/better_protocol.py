@@ -17,6 +17,28 @@ CURRICULUM = ['level1/'+name for name in [*ACTIVATIONS,
  '47_Sum_reduction_over_a_dimension','48_Mean_reduction_over_a_dimension',
  '94_MSELoss','96_HuberLoss','1_Square_matrix_multiplication_']]
 
+# Level-2 fusion tasks, original shapes, hybrid contract. Fixed by rule before any measurement: train split,
+# head Gemm/Matmul/Conv2d, every later op elementwise (no reductions, norms, pooling, softmax, min/max, dropout).
+FUSION_CURRICULUM = ['level2/'+name for name in [
+ '12_Gemm_Multiply_LeakyReLU','1_Conv2D_ReLU_BiasAdd','29_Matmul_Mish_Mish','40_Matmul_Scaling_ResidualAdd',
+ '53_Gemm_Scaling_Hardtanh_GELU','54_Conv2d_Multiply_LeakyReLU_GELU','57_Conv2d_ReLU_HardSwish',
+ '59_Matmul_Swish_Scaling','63_Gemm_ReLU_Divide','69_Conv2d_HardSwish_ReLU','70_Gemm_Sigmoid_Scaling_ResidualAdd',
+ '71_Conv2d_Divide_LeakyReLU','76_Gemm_Add_ReLU','81_Gemm_Swish_Divide_Clamp_Tanh_Clamp','86_Matmul_Divide_GELU',
+ '87_Conv2d_Subtract_Subtract_Mish','95_Matmul_Add_Swish_Tanh_GELU_Hardtanh','9_Matmul_Subtract_Multiply_ReLU']]
+FUSION_ELEMENTWISE = {'multiply','leakyrelu','divide','scaling','scale','relu','add','swish','sigmoid','tanh','gelu',
+ 'mish','hardtanh','clamp','subtract','residualadd','biasadd','hardswish'}
+
+
+def fusion_selection(tasks):
+    selected=[]
+    for task_id,task in sorted(tasks.items()):
+        if task.level!=2 or task.split!='train':continue
+        head,*chain=task_id.split('/')[1].split('_',1)[1].split('_')
+        if head.lower() in ('gemm','matmul','conv2d') and chain and all(c.lower() in FUSION_ELEMENTWISE for c in chain):
+            selected.append(task_id)
+    return selected
+
+
 # Freeze these before GPU calibration; evaluation always keeps the original task source.
 TRAINING_VARIANT = 0
 TRAINING_SHAPES = {

@@ -97,3 +97,15 @@ def test_reuse_requires_complete_exact_source_and_verified_code(tmp_path):
     assert reuse_verified(tmp_path,expected) is None
     (tmp_path/'verified.jsonl').write_text('')
     assert reuse_verified(tmp_path,expected) is None
+
+
+def test_fusion_curriculum_is_exactly_the_preregistered_rule_and_disjoint_from_eval():
+    import os,pytest
+    if not os.environ.get('KERNELBENCH_DIR'):pytest.skip('pinned KernelBench source required')
+    from kernel_env.server.tasks import load_tasks
+    from better_protocol import FUSION_CURRICULUM,fusion_selection
+    tasks=load_tasks()
+    assert sorted(FUSION_CURRICULUM)==fusion_selection(tasks) and len(FUSION_CURRICULUM)==18
+    chain=lambda t:t.split('/')[1].split('_',1)[1].lower()
+    evals={chain(t) for t,v in tasks.items() if v.split=='eval'}
+    assert all(tasks[t].split=='train' and chain(t) not in evals for t in FUSION_CURRICULUM)

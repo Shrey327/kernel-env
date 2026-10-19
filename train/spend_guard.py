@@ -19,11 +19,12 @@ class SpendGuard:
             temp.replace(self.path)
             return result
 
-    def reserve(self,stage,envelope,seconds):
+    def reserve(self,stage,envelope,seconds,gpus=2):
         if not 0<seconds<=6*3600:raise ValueError('invalid bounded job duration')
+        if gpus not in (1,2):raise ValueError('invalid GPU count')
         def reserve(ledger):
-            # $10/h bounds two unpinned H100s + max8CPU/64GiB; retain startup/teardown time.
-            amount=seconds*10/3600
+            # $5/h per unpinned H100 bounds GPU + max8CPU/64GiB (~$4.84/h for one); retain startup/teardown time.
+            amount=seconds*5*gpus/3600
             rows=ledger['new_jobs']
             if any(row['state'] in ('reserved','launched','uncertain','cancel_requested') for row in rows):
                 raise RuntimeError('another authorized stage is still active or uncertain')
@@ -37,7 +38,7 @@ class SpendGuard:
                 raise RuntimeError('shared additional USD100 cap or stage envelope would be exceeded')
             item={'reservation_id':uuid.uuid4().hex,'stage':stage,'envelope':envelope,
                   'submitted_unix':time.time(),'deadline_unix':time.time()+seconds-30,
-                  'reserved_upper_usd':amount,'max_resource_seconds':seconds,'state':'reserved'}
+                  'reserved_upper_usd':amount,'max_resource_seconds':seconds,'gpus':gpus,'state':'reserved'}
             rows.append(item);ledger['new_reserved_upper_usd']=used+amount
             ledger['auxiliary_and_contingency_reserve_usd']=auxiliary
             return item

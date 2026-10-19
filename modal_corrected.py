@@ -11,10 +11,11 @@ app=modal.App('kernel-env-corrected-20261019')
 runs=modal.Volume.from_name('kernel-env-runs')
 
 
-@app.function(image=train_image,gpu='H100',cpu=(4,8),memory=(32768,65536),timeout=1740,
+@app.function(image=train_image,gpu='H100',cpu=(4,8),memory=(32768,65536),timeout=2940,
               startup_timeout=90,retries=0,max_containers=1,scaledown_window=2,volumes={'/runs':runs})
 def validate(reservation,contract,budget):
     verify_sources(Path(__file__).parent,contract['source_files'])
+    os.environ.update(contract['protocol']['env'])  # hybrid contract + few-shot prompt, identical for every phase
     root=Path('/runs')/RUN;out=root/'validation'/reservation['reservation_id'];out.mkdir(parents=True,exist_ok=False)
     (root/'progress').mkdir(exist_ok=True)
     progress=root/'progress'/(reservation['reservation_id']+'.json')
@@ -48,6 +49,7 @@ def stage(phase,reservation,contract,budget,gates):
     from corrected_contract import require_gate
     verify_sources(Path(__file__).parent,contract['source_files'])
     for name in ('gpu-validation','reward-calibration','sft-verification'):require_gate(gates[name],contract,name)
+    os.environ.update(contract['protocol']['env'])
     if phase=='train':
         require_gate(gates['pilot'],contract,'pilot');require_gate(gates['independent-review'],contract,'independent-review')
     if phase.startswith('eval-'):require_gate(gates['independent-review'],contract,'independent-review')

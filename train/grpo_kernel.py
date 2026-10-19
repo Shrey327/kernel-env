@@ -232,7 +232,8 @@ def main():
     protocol_binding=None
     if args.protocol_manifest:
         protocol_binding=json.loads(open(args.protocol_manifest).read())
-        if protocol_binding.get('run_id')!='corrected-20261019' or not protocol_binding.get('protocol_digest'):
+        from corrected_contract import RUN
+        if protocol_binding.get('run_id')!=RUN or not protocol_binding.get('protocol_digest'):
             raise ValueError('invalid corrected protocol manifest')
         with open(os.path.join(cfg.output_dir,'protocol_binding.json'),'w') as f:json.dump(protocol_binding,f,indent=2)
 

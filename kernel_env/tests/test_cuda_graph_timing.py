@@ -189,7 +189,7 @@ def test_fresh_reference_and_copy_stream_is_ready_before_first_graph_replay():
 def test_method_and_floor_metadata_describe_unsubtracted_event_interval():
     from kernel_env.server.cuda_graph_timing import METHOD,MEASUREMENT_SCOPE,calibrated_floor
     api,_=fake_torch();floor,metadata=calibrated_floor(api,work_for('fresh'),'cuda')
-    assert METHOD=='fresh_paired_cuda_graph_event_interval_v4'
+    assert METHOD=='fresh_paired_cuda_graph_event_interval_v5'
     assert 'unsubtracted launch overhead' in MEASUREMENT_SCOPE
     assert metadata['measurement_scope']==MEASUREMENT_SCOPE
     assert floor==max(metadata['event_resolution_per_invocation_ms'],

@@ -5,6 +5,36 @@ from importlib.metadata import version
 from corrected_contract import METHOD,verify_sources
 
 
+HYBRID_GEMM='''import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def bias_relu_kernel(y_ptr, b_ptr, out_ptr, n, cols, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    y = tl.load(y_ptr + offs, mask=mask) + tl.load(b_ptr + offs % cols, mask=mask)
+    tl.store(out_ptr + offs, tl.maximum(y, 0.0), mask=mask)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias_shape):
+        super().__init__()
+        self.gemm = nn.Linear(in_features, out_features, bias=False)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        y = F.linear(x, self.gemm.weight).contiguous()
+        out = torch.empty_like(y)
+        n = y.numel()
+        bias_relu_kernel[(triton.cdiv(n, 1024),)](y, self.bias, out, n, y.shape[1], BLOCK=1024)
+        return out
+'''
+
+
 class BoundedCases:
     """An upfront manifest, durable outcomes, and a fail-closed aggregate."""
     def __init__(self,out,manifest,deadline,progress_path,clock=time.time):
@@ -73,11 +103,12 @@ def main(argv=None):
     identity_shapes=((32,16384),(32,262144),(64,262144))
     identity_names=[str(shape) for shape in identity_shapes];required_regimes=identity_names[1:]
     teacher_names=['teacher '+tid+'/'+str(variant) for tid in CURRICULUM for variant in (0,1)]
+    hybrid_names=['few-shot example level1','few-shot example level2','hybrid fp32 library control','hybrid half-precision library']
     adversary_names=['unjoined stream short','unjoined stream long','late zeros','cached output','late mutation','graph incompatible']
     manifest=[{'case':name,'required':True} for name in ('source identity','pinned integration','task source identity','clean SFT identity')]
     manifest += [{'case':'identity '+name,'required':name in required_regimes} for name in identity_names]
     manifest += [{'case':name,'required':True} for name in ['installed trainer credit','reward calibration','known fused original6GiB Softsign',*adversary_names,
-                 *['fast-kernel noise replicate '+str(i+1) for i in range(3)],'fast-kernel residual reward noise',*teacher_names]]
+                 *['fast-kernel noise replicate '+str(i+1) for i in range(3)],'fast-kernel residual reward noise',*teacher_names,*hybrid_names]]
     cases=BoundedCases(out,manifest,a.deadline,a.progress);runtime={};controls={};reward={};repeats=[]
     trusted=('source identity','pinned integration','task source identity','clean SFT identity')
     try:
@@ -229,6 +260,19 @@ def main(argv=None):
                         value.update(task_id=tid,variant=variant,code_sha256=hashlib.sha256(teacher_source(tasks[tid]).encode()).hexdigest())
                         return value,value.get('correct') and value.get('timing_method')==METHOD
                     cases.run('teacher '+tid+'/'+str(variant),teacher,requires=trusted,gpu=True)
+            from kernel_env.server import fewshot
+            for level,(tid,reference,solution) in fewshot.EXAMPLES.items():
+                def example(tid=tid,reference=reference,solution=solution):
+                    value=evaluate(reference,solution,tid,timeout=600)
+                    return value,value.get('correct') and value.get('timing_method')==METHOD
+                cases.run('few-shot example level'+str(level),example,requires=trusted,gpu=True)
+            gemm=tasks['level2/76_Gemm_Add_ReLU']
+            def hybrid(half):
+                value=evaluate(gemm.src,HYBRID_GEMM.replace('F.linear(x, self.gemm.weight)','F.linear(x.half(), self.gemm.weight.half()).float()') if half else HYBRID_GEMM,gemm.task_id)
+                if half:return value,value.get('stage')=='format' and 'Reduced-precision' in value.get('feedback','')
+                return value,value.get('correct') and value.get('timing_method')==METHOD
+            cases.run('hybrid fp32 library control',lambda:hybrid(False),requires=trusted,gpu=True)
+            cases.run('hybrid half-precision library',lambda:hybrid(True),requires=trusted,gpu=True)
         else:
             for spec in manifest:
                 if spec['case'] not in cases.results:cases.run(spec['case'],lambda:({},False),requires=trusted)
@@ -246,7 +290,7 @@ def main(argv=None):
         binding={key:gate[key] for key in ('run_id','source_digest','protocol_digest','sft_sha256','teacher_dataset_sha256')}
         stage_cases={'gpu-validation':[r['case'] for r in manifest if r.get('required',True)],
                      'reward-calibration':['reward calibration','fast-kernel residual reward noise','installed trainer credit',
-                                           *['identity '+name for name in required_regimes],*adversary_names],
+                                           *['identity '+name for name in required_regimes],*adversary_names,*hybrid_names],
                      'sft-verification':['clean SFT identity',*teacher_names]}
         gates={}
         for stage,names in stage_cases.items():

@@ -110,7 +110,7 @@ def test_calibration_retains_later_regimes_after_early_sensitivity_failure():
 def test_calibration_checks_later_replicates_and_missing_required_regime():
     from reward_calibration_artifact import calibrate
     control=calibration_control()
-    control['replicates'][2]['ref_timing_samples_ms']=[.003344]*3
+    control['replicates'][2]['ref_timing_samples_ms']=[.003344]*7
     control['calibration']['absolute_floor_ms']=.0001685
     value=calibrate({'training':control},{'passed':True},required_regimes=['training','missing'])
     assert not value['passed'] and len(value['regimes'])==3

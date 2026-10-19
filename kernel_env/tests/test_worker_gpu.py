@@ -29,7 +29,7 @@ def test_good_kernel_is_correct_and_timed(ev):
     assert 0.05 < res["roofline_frac"] <= 1.0 and 0.05 < res["ref_roofline_frac"] <= 1.0, res
     assert "Roofline on" in res["feedback"]
     assert len(res['timing_samples_ms']) == 3
-    assert res['timing_method'] == 'fresh_paired_cuda_graph_event_interval_v4'
+    assert res['timing_method'] == 'fresh_paired_cuda_graph_event_interval_v5'
     assert min(res['timing_samples_ms']) <= res['t_new_ms'] <= max(res['timing_samples_ms'])
 
 
@@ -107,7 +107,7 @@ def test_very_slow_kernel_is_correct_and_timed(ev):
     if res['timing_method'] == 'correctness_wall_slow':
         assert 'very slow' in res['feedback']
     else:
-        assert res['timing_method'] == 'fresh_paired_cuda_graph_event_interval_v4'
+        assert res['timing_method'] == 'fresh_paired_cuda_graph_event_interval_v5'
         assert len(res['timing_samples_ms']) == 3
 
 

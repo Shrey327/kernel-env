@@ -1,4 +1,5 @@
 """Fresh paired timing with engineering uncertainty bounds, not confidence intervals."""
+import json
 import math
 import random
 import statistics
@@ -26,11 +27,32 @@ def cuda_coverage(events, kernel_names):
             'top_kernels':sorted(rows,key=lambda row:row[1],reverse=True)[:3]}
 
 
-def paired_timings(measure_reference, measure_candidate, seed=0, absolute_floor_ms=.001):
+def generated_replay_profile(run, attempts=3):
+    """Replay of a captured graph is fixed work, so only a trace with no CUDA events at all
+    (a dropped profiler record) is retried; real but non-generated work is rejected at once."""
+    for attempt in range(1, attempts+1):
+        summary=run();summary['profile_attempts']=attempt
+        if summary['generated_cuda_fraction'] > 0:
+            return summary
+        if summary['cuda_time_us'] > 0 or summary['top_kernels']:
+            break
+    raise ValueError('No generated CUDA work in captured replay: '+json.dumps(summary,default=str)[:400])
+
+PAIRED_ROUNDS=7
+
+
+def interquartile_range(values):
+    # A single interference spike widens the full range of 3 samples; the IQR of 7 ignores it.
+    q1,_,q3=statistics.quantiles(values,n=4,method='inclusive')
+    return q3-q1
+
+
+def paired_timings(measure_reference, measure_candidate, seed=0, absolute_floor_ms=.001, rounds=PAIRED_ROUNDS):
     if not math.isfinite(absolute_floor_ms) or absolute_floor_ms<0:raise ValueError("invalid timing floor")
+    if rounds<5:raise ValueError('at least five paired rounds required for an interquartile band')
     rng = random.Random(seed)
     reference, candidate = [], []
-    for _ in range(3):
+    for _ in range(rounds):
         order = [('reference', measure_reference), ('candidate', measure_candidate)]
         rng.shuffle(order)
         for name, measure in order:
@@ -39,8 +61,8 @@ def paired_timings(measure_reference, measure_candidate, seed=0, absolute_floor_
                 raise ValueError('invalid paired timing')
             (reference if name == 'reference' else candidate).append(value)
     ref, new = statistics.median(reference), statistics.median(candidate)
-    ref_band = max(.02*ref, absolute_floor_ms, max(reference)-min(reference))
-    new_band = max(.02*new, absolute_floor_ms, max(candidate)-min(candidate))
+    ref_band = max(.02*ref, absolute_floor_ms, interquartile_range(reference))
+    new_band = max(.02*new, absolute_floor_ms, interquartile_range(candidate))
     return {'t_ref_ms':ref, 't_new_ms':new, 'ref_timing_samples_ms':reference,
             'timing_samples_ms':candidate, 'speedup':ref/new,
             'speedup_lower_bound':max(0,ref-ref_band)/(new+new_band),

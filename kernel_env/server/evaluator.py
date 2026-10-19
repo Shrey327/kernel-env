@@ -78,7 +78,7 @@ class Evaluator:
     def evaluate(self, ref_src: str, code: str, language: str, seeds: List[int], task_id: str = "") -> Dict:
         """Result dict also carries gpu_id, queue_wait_s (waiting for a free GPU) and eval_s."""
         t0 = time.monotonic()
-        errors = check_source(code, language)
+        errors = check_source(code, language, task_id)
         if errors:
             return {"stage": "format", "feedback": "Rejected before running:\n- " + "\n- ".join(errors[:10]),
                     "gpu_id": None, "queue_wait_s": 0.0, "eval_s": time.monotonic() - t0}

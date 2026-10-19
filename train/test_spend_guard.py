@@ -30,3 +30,10 @@ def test_all_retries_share_cap_and_envelopes(tmp_path):
     row=guard.reserve('train','training',6*3600)
     guard.record(row['reservation_id'],state='complete')
     with pytest.raises(RuntimeError):guard.reserve('train-again','training',1)
+
+
+def test_single_gpu_validation_reserves_half_the_two_gpu_bound(tmp_path):
+    guard=ledger(tmp_path)
+    row=guard.reserve('validate','validation_warmup_pilot',1800,gpus=1)
+    assert row['reserved_upper_usd']==pytest.approx(2.5) and row['gpus']==1
+    with pytest.raises(ValueError):guard.reserve('bad','training',60,gpus=3)
