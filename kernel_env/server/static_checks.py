@@ -3,8 +3,8 @@
 Goal: reject submissions that compute with PyTorch instead of custom kernels, or that try to
 tamper with the evaluator (imports, monkeypatching, introspection escapes).
 
-shortcut: tensor arithmetic operators (x + y, x * 2) in host code are not detected statically;
-upgrade to a runtime profiler check (only custom-kernel launches allowed) if agents exploit it.
+Tensor arithmetic operators are checked at runtime in worker.kernel_only_mode, where tensors can
+be distinguished from legitimate scalar/shape arithmetic.
 """
 
 import ast

@@ -52,8 +52,24 @@ RULES = {
 def build_prompt(task: Task, language: str = "triton", max_turns: int = 4) -> str:
     """Prompt version from KERNEL_ENV_PROMPT ("2" default; "1" = the prompt used for the v1-v3 baselines)."""
     if os.environ.get("KERNEL_ENV_PROMPT", "2") == "1" or language != "triton":
-        return _prompt_v1(task, language, max_turns)
-    return _prompt_v2(task, max_turns)
+        prompt = _prompt_v1(task, language, max_turns)
+    else:
+        prompt = _prompt_v2(task, max_turns)
+    if task.task_id in {"level1/23_Softmax", "level1/37_FrobeniusNorm_"}:
+        prompt += ("\nValidation for this normalization task also uses constant, peaked or signed inputs, "
+                   "atol=min(configured_atol, max(abs(reference))*1e-5), the configured rtol, "
+                   "and normalization invariants. "
+                   "Softmax rows must sum to 1; Frobenius normalization uses one global norm, not per-slice norms.")
+    from .worker import ACTIVATION_TASKS, REDUCTION_TASKS, REGRESSION_LOSSES
+    if task.task_id in ACTIVATION_TASKS:
+        prompt += ('\nValidation also uses signed inputs in [-32,32] and zeros at the original shape. '
+                   'Implement the full activation, including negative inputs; timing uses the original generator.')
+    if task.task_id in REDUCTION_TASKS:
+        prompt += '\nCorrectness also checks zero and shifted/scaled inputs at the original shape; timing uses the original generator.'
+    if task.task_id in REGRESSION_LOSSES:
+        prompt += '\nCorrectness also checks identical prediction/target tensors and zero predictions with target 2 at the original shape; timing uses the original generator.'
+    prompt += '\nCandidate CUDA work must use a single stream; side-stream work is rejected.'
+    return prompt
 
 
 def _prompt_v1(task: Task, language: str, max_turns: int) -> str:

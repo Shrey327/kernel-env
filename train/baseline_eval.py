@@ -29,6 +29,12 @@ STAGE_ORDER = ["format", "compile", "runtime", "timeout", "correctness", "timed"
 _FENCE = re.compile(r"```(\w*)[^\n]*\n(.*?)```", re.DOTALL)
 
 
+def episode_return(rewards: list, mode: str, gamma: float) -> float:
+    if mode == 'best':
+        return max(rewards, default=0.0)
+    return sum(gamma**t * r for t,r in enumerate(rewards))
+
+
 def extract_code(text: str) -> str:
     """Last ```python block, else last fenced block, else the raw text (prompt asks for bare source)."""
     blocks = _FENCE.findall(text)
@@ -51,6 +57,8 @@ def feedback_message(obs, truncated: bool = False) -> str:
         msg += f" Correct, speedup {obs.speedup:.2f}x (ref {obs.t_ref_ms:.3f} ms, yours {obs.t_new_ms:.3f} ms)."
     if obs.feedback:
         msg += f"\n{obs.feedback}"
+    if getattr(obs, 'profiling_summary', None):
+        msg += f"\nMeasured CUDA profile: {obs.profiling_summary}"
     if obs.turn < obs.max_turns:
         msg += "\nImprove it (fix errors first, then make it faster). Reply with the complete module source only."
     return msg
@@ -59,7 +67,7 @@ def feedback_message(obs, truncated: bool = False) -> str:
 def summarize(episodes: list) -> dict:
     """episodes: dicts with `turns` = [{"stage", "correct", "speedup", "reward"}, ...]."""
     n = max(len(episodes), 1)
-    furthest = [max((STAGE_ORDER.index(t["stage"]) for t in ep["turns"]), default=0) for ep in episodes]
+    furthest = [max((STAGE_ORDER.index(t["stage"]) for t in ep["turns"] if t["stage"] in STAGE_ORDER), default=0) for ep in episodes]
     best = [max((t["speedup"] for t in ep["turns"] if t["correct"]), default=None) for ep in episodes]
     sp = [s for s in best if s is not None]
     roof = [max((t["roofline_frac"] for t in ep["turns"] if t["correct"] and t.get("roofline_frac")), default=None)
@@ -67,11 +75,14 @@ def summarize(episodes: list) -> dict:
     roof = [r for r in roof if r is not None]
     return {
         "episodes": len(episodes),
+        "infrastructure_failures": sum(bool(ep.get("infrastructure_error")) or any(t["stage"] == "infrastructure" for t in ep["turns"]) for ep in episodes),
         "compile_pct": 100 * sum(f >= STAGE_ORDER.index("runtime") for f in furthest) / n,
         "correct_pct": 100 * len(sp) / n,
         "correct_turn1_pct": 100 * sum(bool(ep["turns"] and ep["turns"][0]["correct"]) for ep in episodes) / n,
         "faster_than_ref_pct": 100 * sum(s > 1.0 for s in sp) / n,
         "mean_speedup": statistics.fmean(sp) if sp else None,
+        "mean_speedup_including_failures": sum(sp)/n,
+        "clear_faster_pct": 100*sum(any(t.get("correct") and (t.get("speedup_lower_bound") or 0)>1 for t in ep["turns"]) for ep in episodes)/n,
         "median_speedup": statistics.median(sp) if sp else None,
         "median_roofline_frac": statistics.median(roof) if roof else None,
         "stage_hist_all_turns": dict(Counter(t["stage"] for ep in episodes for t in ep["turns"])),
@@ -153,22 +164,28 @@ def run_episodes(generate, env_url: str, task_ids: list, split: str = "eval", en
 
 
 def run_episodes_pipelined(chat, env_url: str, task_ids: list, split: str = "eval", env_timeout_s: float = 3600.0,
-                           on_done=None, on_step=None) -> list:
+                           on_done=None, on_step=None, seeds=None) -> list:
     """One independent loop per episode (generate -> step -> ...), all concurrent.
 
     Against a vLLM server, continuous batching overlaps one episode's generation with another's
     kernel eval, instead of every episode waiting for the slowest one each turn. An episode that
     raises is kept with its error so one failure never loses the run.
     """
-    def one(task_id):
+    if seeds is not None and len(seeds) != len(task_ids):
+        raise ValueError("one generation seed is required per episode")
+
+    def one(job):
+        task_id, seed = job
         ep = {"task_id": task_id, "turns": [], "completions": [], "reasoning": []}
+        if seed is not None:
+            ep["sample_seed"] = seed
         env = KernelEnv(base_url=env_url, message_timeout_s=env_timeout_s).sync()
         try:
-            o = env.reset(task_id=task_id, split=split).observation
+            o = env.reset(task_id=task_id, split=split, **({"seed": seed} if seed is not None else {})).observation
             conv = [{"role": "user", "content": o.problem}]
             while True:
                 t0 = time.monotonic()
-                text, finish, reasoning, ntok = chat(conv)
+                text, finish, reasoning, ntok = chat(conv, seed=seed + len(ep["turns"])) if seed is not None else chat(conv)
                 gen_s = time.monotonic() - t0
                 t1 = time.monotonic()
                 r = env.step(KernelAction(code=extract_code(text)))
@@ -179,6 +196,13 @@ def run_episodes_pipelined(chat, env_url: str, task_ids: list, split: str = "eva
                 ep["turns"].append({"stage": o.stage, "correct": bool(o.correct), "speedup": o.speedup or 0.0,
                                     "reward": r.reward or 0.0, "feedback": o.feedback,
                                     "t_ref_ms": o.t_ref_ms, "t_new_ms": o.t_new_ms, "t_min_ms": o.t_min_ms,
+                                    "timing_samples_ms": o.timing_samples_ms, "timing_method": o.timing_method,
+                                    "ref_timing_samples_ms": o.ref_timing_samples_ms,
+                                    "speedup_lower_bound": o.speedup_lower_bound, "speedup_upper_bound": o.speedup_upper_bound,
+                                    "reward_mode": o.reward_mode,"reward_spec":o.reward_spec,
+                                            "correctness_reward":o.correctness_reward,"performance_reward":o.performance_reward,
+                                            "conservative_speedup":o.conservative_speedup,"rewarded_speedup":o.rewarded_speedup,"measurement_scope":o.measurement_scope,
+                                            "graph_repeats":o.graph_repeats,"timing_calibration":o.timing_calibration,"warmup_evidence":o.warmup_evidence,
                                     "bound": o.bound, "roofline_frac": o.roofline_frac,
                                     "ref_roofline_frac": o.ref_roofline_frac, "truncated": truncated,
                                     "completion_tokens": ntok, "gen_s": gen_s, "step_s": step_s})
@@ -191,14 +215,15 @@ def run_episodes_pipelined(chat, env_url: str, task_ids: list, split: str = "eva
             ep.update(episode_id=st.episode_id, history=st.history)
         except Exception as e:  # keep partial episode
             ep["error"] = repr(e)
+            ep["infrastructure_error"] = True
         finally:
             env.close()
         if on_done:
             on_done(ep)
         return ep
 
-    with ThreadPoolExecutor(max_workers=max(len(task_ids), 1)) as pool:
-        return list(pool.map(one, task_ids))
+    with ThreadPoolExecutor(max_workers=min(8, max(len(task_ids), 1))) as pool:
+        return list(pool.map(one, zip(task_ids, seeds if seeds is not None else [None] * len(task_ids))))
 
 
 def start_vllm_server(model: str, port: int, max_model_len: int, tp: int, spec_mtp: int, extra: str):
@@ -228,9 +253,10 @@ def make_chat(base_url: str, model: str, temperature: float, max_new_tokens: int
 
     client = OpenAI(base_url=base_url, api_key="EMPTY", timeout=7200)
 
-    def chat(conv):
+    def chat(conv, seed=None):
         r = client.chat.completions.create(
             model=model, messages=conv, temperature=temperature, max_tokens=max_new_tokens,
+            **({"seed": seed} if seed is not None else {}),
             extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}})
         c = r.choices[0]
         return (c.message.content or "", c.finish_reason, getattr(c.message, "reasoning_content", None),
@@ -290,6 +316,7 @@ def main():
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--samples", type=int, default=1, help="episodes per task (use temperature > 0) for pass@k")
     p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--seed", type=int, default=None, help="paired per-sample generation seeds for pipelined evaluation")
     p.add_argument("--max-new-tokens", type=int, default=4096)
     p.add_argument("--enable-thinking", action="store_true", help="Qwen3-style <think>; raise --max-new-tokens with it")
     p.add_argument("--batch-size", type=int, default=8, help="HF backend generate batch")
@@ -351,7 +378,9 @@ def main():
 
     try:
         if args.backend in ("vllm-server", "openai"):
-            eps = run_episodes_pipelined(chat, args.env_url, task_ids, args.split, on_done=on_done, on_step=on_step)
+            seeds = [args.seed + i % args.samples for i in range(len(task_ids))] if args.seed is not None else None
+            eps = run_episodes_pipelined(chat, args.env_url, task_ids, args.split, on_done=on_done, on_step=on_step,
+                                        seeds=seeds)
         else:
             eps = run_episodes(generate, args.env_url, task_ids, args.split, on_done=on_done, on_turn=on_turn)
     finally:

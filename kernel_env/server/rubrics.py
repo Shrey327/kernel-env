@@ -37,6 +37,22 @@ class Roofline(Rubric):
         return 0.3 + 2.7 * min(f, 1.0) if f else self.fallback(action, observation)
 
 
+class CalibratedSpeedup(Rubric):
+    def forward(self,action,observation):
+        from .calibrated_reward import quality
+        return quality(observation.correct,observation.speedup_lower_bound,observation.speedup_upper_bound)
+
+
+class PairedSpeedup(Rubric):
+    def forward(self, action, observation) -> float:
+        low, high = observation.speedup_lower_bound, observation.speedup_upper_bound
+        if low is None or high is None:
+            raise ValueError('fresh paired speedup evidence is required')
+        # Engineering ties around parity avoid learning sub-percent clock differences.
+        value = 1.0 if low <= 1 <= high else low
+        return 1.0 + min(max(value, 0.0), 3.0)
+
+
 PARTIAL_CREDIT = {"runtime": 0.02, "timeout": 0.02, "correctness": 0.05}
 
 
@@ -54,6 +70,7 @@ class KernelReward(Rubric):
 
 def kernel_rubric(mode: str = "", partial: bool = None) -> Rubric:
     mode = mode or os.environ.get("KERNEL_ENV_REWARD", "speedup")
-    if partial is None:
+    if mode=="calibrated_speedup_v2":partial=False
+    elif partial is None:
         partial = os.environ.get("KERNEL_ENV_PARTIAL_CREDIT") == "1"
-    return KernelReward(Sequential(Gate(Correct()), {"speedup": Speedup, "roofline": Roofline}[mode]()), partial)
+    return KernelReward(Sequential(Gate(Correct()), {"speedup": Speedup, "roofline": Roofline, "paired_speedup": PairedSpeedup,"calibrated_speedup_v2":CalibratedSpeedup}[mode]()), partial)

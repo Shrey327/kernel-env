@@ -106,6 +106,7 @@ def test_rollout_func_against_mock_server(tmp_path):
 
     logged = [json.loads(line) for line in (tmp_path / "rollouts-rank0.jsonl").read_text().splitlines()]
     assert len(logged) == n and all(len(ep["completions"]) == len(ep["turns"]) == max_turns for ep in logged)
+    assert all(ep['raw_return'] == ep['learning_return'] and len(ep['return_band']) == 2 for ep in logged)
     assert "Turn by turn" in render(logged, "rollouts")
 
 
@@ -137,6 +138,71 @@ def test_pipelined_episodes_against_mock_server():
         assert all(t["correct"] and not t["truncated"] for t in ep["turns"][1:])
         assert ep["episode_id"] and len(ep["history"]) == len(ep["turns"])
     assert sum("cut off before the module was complete" in f for f in seen_feedback) == 2
+
+
+def test_rollout_overlaps_generation_and_evaluation_without_policy_updates(tmp_path, monkeypatch):
+    import threading
+    import grpo_kernel
+    from kernel_env import KernelObservation, KernelState
+
+    entered, release = threading.Event(), threading.Event()
+    tok = _tok()
+
+    class Env:
+        def __init__(self, **kwargs):
+            self.turn = 0
+
+        def sync(self):
+            return self
+
+        def reset(self, **kwargs):
+            return SimpleNamespace(observation=KernelObservation(problem='P', max_turns=2))
+
+        def step(self, action):
+            self.turn += 1
+            entered.set()
+            assert release.wait(5), 'evaluation blocked the next generation batch'
+            obs = KernelObservation(stage='format', feedback='bad source', turn=self.turn,
+                                    max_turns=2, done=self.turn==2, correct=False)
+            return SimpleNamespace(observation=obs, reward=0.0, done=obs.done)
+
+        def state(self):
+            return KernelState(episode_id='test')
+
+        def close(self):
+            pass
+
+    class Trainer(FakeTrainer):
+        def _generate_single_turn(self, prompts, *args):
+            assert len(prompts) <= 2
+            if self.calls == 1:
+                assert entered.wait(5)
+                release.set()  # The first evaluations are still in flight at generation call two.
+            return super()._generate_single_turn(prompts, *args)
+
+    monkeypatch.setattr(grpo_kernel, 'KernelEnv', Env)
+    trainer = Trainer(tok)
+    result = make_rollout_func(KernelArgs(rollout_batch_size=2), str(tmp_path/'s.jsonl'))([TASK]*4, trainer)
+    assert len(result['completion_ids']) == 4 and result['episode_return'] == [0.0]*4
+    for ids, mask in zip(result['completion_ids'], result['env_mask']):
+        assert len(ids) == len(mask) and 0 in mask and 1 in mask
+    assert trainer._metrics['train']['rollout/generated_tokens'][0] > 0
+    assert trainer.state.global_step == 0
+
+
+@pytest.mark.skipif(not URL, reason='set KERNEL_ENV_URL to a mock kernel_env server')
+def test_paired_episode_seeds_reach_generation_and_logs():
+    seeds = []
+
+    def chat(conv, seed):
+        seeds.append(seed)
+        return GOOD, 'stop', None, 10
+
+    eps = run_episodes_pipelined(chat, URL, [TASK, TASK], seeds=[100, 200])
+    assert [ep['sample_seed'] for ep in eps] == [100, 200]
+    assert 100 in seeds and 200 in seeds
+    with pytest.raises(ValueError):
+        run_episodes_pipelined(chat, URL, [TASK], seeds=[])
 
 
 def test_feedback_ids_qwen35_template():

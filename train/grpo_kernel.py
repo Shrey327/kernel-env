@@ -7,22 +7,28 @@ All GRPOConfig / ModelConfig fields are CLI flags (TrlParser). Dataset rows are 
 ids; rollout_func resets one env session per row (TRL already repeats each row `num_generations`
 times = one GRPO group per task), then alternates model turn -> env.step -> feedback turn until the
 env ends the episode. The whole episode is one completion: model tokens train (env_mask=1), feedback
-tokens don't (env_mask=0). Reward = discounted sum of per-turn env rewards, or best turn.
+tokens don't (env_mask=0). Raw return is the discounted sum (or best) per-turn reward.
+Timing-equivalent candidates with the same correctness pattern receive tied learning returns.
 Held-out eval = TRL's own eval loop over eval-split task ids (`--eval_strategy steps --eval_steps N`).
 """
 
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
+import time
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 
 from datasets import Dataset
 from transformers.trainer_utils import get_last_checkpoint
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, TrlParser, get_peft_config
 
-from baseline_eval import extract_code, feedback_message, split_task_ids, summarize
+from baseline_eval import episode_return, extract_code, feedback_message, split_task_ids, summarize
 from kernel_env import KernelAction, KernelEnv
+from kernel_env.client import EnvironmentInfrastructureError
+from reward_noise import noise_aware_returns
+from trajectory_credit import independent_returns, calibrated_progress_returns, loo_scale
 
 log = logging.getLogger("grpo_kernel")
 
@@ -38,12 +44,12 @@ class KernelArgs:
     env_timeout_s: float = field(default=900.0, metadata={"help": "per env message; covers GPU-pool queueing"})
     max_eval_tasks: int = field(default=0, metadata={"help": "cap held-out tasks per eval (0 = all)"})
     task_file: str = field(default="", metadata={"help": "JSON list of training task ids (curriculum); default: whole train split"})
-
-
-def episode_return(rewards: list, mode: str, gamma: float) -> float:
-    if mode == "best":
-        return max(rewards, default=0.0)
-    return sum(gamma**t * r for t, r in enumerate(rewards))
+    rollout_batch_size: int = field(default=0, metadata={"help": "generation microbatch for overlapping GPU evaluation; 0 keeps turn-synchronous batching"})
+    trajectory_loo: bool = field(default=False)
+    independent_timing_returns: bool = field(default=False)
+    calibrated_progress_returns: bool = field(default=False)
+    protocol_manifest: str = field(default="")
+    stop_at_unix: float = field(default=0.0, metadata={"help": "stop training after the current optimizer step at this deadline"})
 
 
 def text_tokenizer(processing_class):
@@ -75,7 +81,8 @@ def make_rollout_func(args: KernelArgs, suspicious_path: str):
         envs = [KernelEnv(base_url=args.env_url, message_timeout_s=args.env_timeout_s).sync() for _ in prompts]
         pool = ThreadPoolExecutor(max_workers=len(envs))
         try:
-            obs = list(pool.map(lambda e, t: e.reset(task_id=t, split=split).observation, envs, prompts))
+            with ThreadPoolExecutor(max_workers=min(4, len(envs))) as reset_pool:
+                obs = list(reset_pool.map(lambda e, t: e.reset(task_id=t, split=split).observation, envs, prompts))
             prompt_ids = [tok.apply_chat_template([{"role": "user", "content": o.problem}], add_generation_prompt=True,
                                                   tokenize=True, return_dict=False, enable_thinking=args.enable_thinking)
                           for o in obs]
@@ -83,28 +90,57 @@ def make_rollout_func(args: KernelArgs, suspicious_path: str):
             comp, mask, lps = [[] for _ in range(n)], [[] for _ in range(n)], [[] for _ in range(n)]
             eps = [{"task_id": t, "turns": [], "codes": [], "completions": [], "step": trainer.state.global_step,
                     "mode": mode} for t in prompts]
-            have_lp, live = True, list(range(n))
-            while live:
-                new_ids, new_lps = trainer._generate_single_turn([prompt_ids[i] + comp[i] for i in live], None, {}, 1)
-                have_lp &= new_lps is not None  # HF generate gives none; vLLM does
-                texts = tok.batch_decode(new_ids, skip_special_tokens=True)
-                codes = [extract_code(t) for t in texts]
-                results = list(pool.map(lambda i, c: envs[i].step(KernelAction(code=c)), live, codes))
-                still = []
-                for j, (i, r) in enumerate(zip(live, results)):
-                    ids, o = list(new_ids[j]), r.observation
-                    comp[i] += ids
-                    mask[i] += [1] * len(ids)
-                    lps[i] += list(new_lps[j]) if have_lp else []
+            have_lp, ready, pending = True, deque(range(n)), {}
+            started, generation_seconds, generated_tokens = time.monotonic(), 0.0, 0
+
+            def evaluate(i, code):
+                start = time.monotonic()
+                result = envs[i].step(KernelAction(code=code))
+                return result, time.monotonic() - start
+
+            while ready or pending:
+                live = [ready.popleft() for _ in range(min(len(ready), args.rollout_batch_size or n))]
+                if live:
+                    start = time.monotonic()
+                    new_ids, new_lps = trainer._generate_single_turn([prompt_ids[i] + comp[i] for i in live], None, {}, 1)
+                    gen_s = time.monotonic() - start
+                    generation_seconds += gen_s
+                    generated_tokens += sum(map(len, new_ids))
+                    have_lp &= new_lps is not None
+                    texts = tok.batch_decode(new_ids, skip_special_tokens=True)
+                    codes = [extract_code(t) for t in texts]
+                    for j, i in enumerate(live):
+                        ids = list(new_ids[j])
+                        comp[i] += ids
+                        mask[i] += [1] * len(ids)
+                        lps[i] += list(new_lps[j]) if have_lp else []
+                        eps[i]["codes"].append(codes[j])
+                        eps[i]["completions"].append(texts[j])
+                        pending[pool.submit(evaluate, i, codes[j])] = (i, ids, gen_s)
+                if not args.rollout_batch_size:
+                    completed = wait(pending).done
+                else:
+                    completed = {f for f in pending if f.done()}
+                    if not ready and not completed:
+                        completed = wait(pending, return_when=FIRST_COMPLETED).done
+                for future in sorted(completed, key=lambda f: pending[f][0]):
+                    i, ids, gen_s = pending.pop(future)
+                    r, step_s = future.result()
+                    o = r.observation
                     truncated = not ids or ids[-1] != tok.eos_token_id
-                    eps[i]["codes"].append(codes[j])
-                    eps[i]["completions"].append(texts[j])
                     eps[i]["turns"].append({"stage": o.stage, "correct": bool(o.correct),
                                             "speedup": o.speedup or 0.0, "reward": r.reward or 0.0,
                                             "roofline_frac": o.roofline_frac, "ref_roofline_frac": o.ref_roofline_frac,
                                             "t_ref_ms": o.t_ref_ms, "t_new_ms": o.t_new_ms, "t_min_ms": o.t_min_ms,
+                                            "timing_samples_ms": o.timing_samples_ms, "timing_method": o.timing_method,
+                                            "ref_timing_samples_ms": o.ref_timing_samples_ms,
+                                            "speedup_lower_bound": o.speedup_lower_bound, "speedup_upper_bound": o.speedup_upper_bound,
+                                            "reward_mode": o.reward_mode,"reward_spec":o.reward_spec,
+                                            "correctness_reward":o.correctness_reward,"performance_reward":o.performance_reward,
+                                            "conservative_speedup":o.conservative_speedup,"rewarded_speedup":o.rewarded_speedup,"measurement_scope":o.measurement_scope,
+                                            "graph_repeats":o.graph_repeats,"timing_calibration":o.timing_calibration,"warmup_evidence":o.warmup_evidence,
                                             "bound": o.bound, "feedback": o.feedback, "truncated": truncated,
-                                            "completion_tokens": len(ids)})
+                                            "completion_tokens": len(ids), "gen_s": gen_s, "step_s": step_s})
                     if r.done:
                         continue
                     # close a truncated turn ourselves so the template stays well-formed
@@ -112,11 +148,22 @@ def make_rollout_func(args: KernelArgs, suspicious_path: str):
                     comp[i] += extra
                     mask[i] += [0] * len(extra)
                     lps[i] += [0.0] * len(extra) if have_lp else []
-                    still.append(i)
-                live = still
+                    ready.append(i)
+            trainer._metrics[mode]["rollout/wall_seconds"].append(time.monotonic() - started)
+            trainer._metrics[mode]["rollout/generation_seconds"].append(generation_seconds)
+            trainer._metrics[mode]["rollout/generated_tokens"].append(float(generated_tokens))
+            trainer._metrics[mode]["rollout/tokens_per_generation_second"].append(generated_tokens / max(generation_seconds, 1e-6))
             for ep, env in zip(eps, envs):
                 st = env.state()
                 ep.update(episode_id=st.episode_id, history=st.history)
+            group_size = getattr(getattr(trainer, 'args', None), 'num_generations', len(eps))
+            if mode == 'eval':
+                group_size = getattr(getattr(trainer, 'args', None), 'num_generations_eval', None) or group_size
+            returns, noise = (calibrated_progress_returns(eps,group_size,args.gamma) if args.calibrated_progress_returns else
+                              independent_returns(eps, group_size, args.gamma) if args.independent_timing_returns
+                              else noise_aware_returns(eps, group_size, args.return_mode, args.gamma))
+            for key, value in noise.items():
+                trainer._metrics[mode]['kernel/'+key].append(float(value))
             # every episode, per rank, for report.py and for reading what the policy is learning
             rank = getattr(getattr(trainer, "accelerator", None), "process_index", 0)
             with open(os.path.join(os.path.dirname(suspicious_path), f"rollouts-rank{rank}.jsonl"), "a") as f:
@@ -124,10 +171,12 @@ def make_rollout_func(args: KernelArgs, suspicious_path: str):
                     f.write(json.dumps(ep) + "\n")
         finally:
             for e in envs:
-                e.close()
+                try:
+                    e.close()
+                except Exception:
+                    log.exception("Environment cleanup failed")
             pool.shutdown()
 
-        returns = [episode_return([t["reward"] for t in ep["turns"]], args.return_mode, args.gamma) for ep in eps]
         log_episodes(trainer, mode, eps, suspicious_path)
         return {"prompt_ids": prompt_ids, "completion_ids": comp, "logprobs": lps if have_lp else None,
                 "env_mask": mask, "episode_return": returns}
@@ -156,6 +205,15 @@ def env_return(prompts, completions, episode_return, **kwargs):
     return episode_return
 
 
+class TrajectoryLOOTrainer(GRPOTrainer):
+    def _generate_and_score_completions(self, *args, **kwargs):
+        output = super()._generate_and_score_completions(*args, **kwargs)
+        group = self.args.num_generations if self.model.training else (self.args.num_generations_eval or self.args.num_generations)
+        if group > 1:
+            output['advantages'] = output['advantages'] * loo_scale(group)
+        return output
+
+
 def main():
     args, cfg, model_args = TrlParser((KernelArgs, GRPOConfig, ModelConfig)).parse_args_and_config()
     cfg.model_init_kwargs = {**(cfg.model_init_kwargs or {}), "dtype": model_args.dtype or "auto"}
@@ -171,8 +229,21 @@ def main():
     eval_ids = eval_ids[: args.max_eval_tasks] if args.max_eval_tasks else eval_ids
     log.info("%d train / %d eval tasks", len(train_ids), len(eval_ids))
     os.makedirs(cfg.output_dir, exist_ok=True)
+    protocol_binding=None
+    if args.protocol_manifest:
+        protocol_binding=json.loads(open(args.protocol_manifest).read())
+        if protocol_binding.get('run_id')!='corrected-20261019' or not protocol_binding.get('protocol_digest'):
+            raise ValueError('invalid corrected protocol manifest')
+        with open(os.path.join(cfg.output_dir,'protocol_binding.json'),'w') as f:json.dump(protocol_binding,f,indent=2)
 
-    trainer = GRPOTrainer(
+    if args.calibrated_progress_returns and args.gamma!=1.:
+        raise ValueError('calibrated best-validated objective requires gamma1')
+    if args.calibrated_progress_returns and not (args.trajectory_loo and args.independent_timing_returns):
+        raise ValueError("calibrated progress requires independent trajectory LOO")
+    trainer_class = TrajectoryLOOTrainer if args.trajectory_loo else GRPOTrainer
+    if args.trajectory_loo and (cfg.scale_rewards != "none" or not args.independent_timing_returns):
+        raise ValueError("trajectory LOO requires independent returns and scale_rewards=none")
+    trainer = trainer_class(
         model=model_args.model_name_or_path,
         reward_funcs=env_return,
         args=cfg,
@@ -181,6 +252,25 @@ def main():
         peft_config=get_peft_config(model_args),
         rollout_func=make_rollout_func(args, os.path.join(cfg.output_dir, "suspicious.jsonl")),
     )
+    from transformers import TrainerCallback
+
+    class LiveMetrics(TrainerCallback):
+        def on_save(self,args,state,control,**kwargs):
+            if protocol_binding:
+                path=os.path.join(args.output_dir,f'checkpoint-{state.global_step}','protocol_binding.json')
+                with open(path,'w') as f:json.dump(protocol_binding,f,indent=2)
+
+        def on_log(self, args, state, control, **kwargs):
+            path = os.path.join(args.output_dir, "live_trainer_state.json")
+            state.save_to_json(path + ".tmp")
+            os.replace(path + ".tmp", path)
+
+        def on_step_end(self, _args, state, control, **kwargs):
+            if args.stop_at_unix and time.time() >= args.stop_at_unix:
+                control.should_training_stop = True
+                control.should_save = True
+
+    trainer.add_callback(LiveMetrics())
     # resume after a crash or a Modal retry: newest checkpoint-* in output_dir, if any
     last = get_last_checkpoint(cfg.output_dir)
     if last:

@@ -51,6 +51,7 @@ def test_episode_rewards_and_done(tasks):
 
     obs = env.step(KernelAction(code=GOOD))
     assert obs.stage == "timed" and obs.reward == pytest.approx(1.3) and not obs.done
+    assert ev.calls[0]["task_id"] == "level1/19_ReLU"
 
     obs = env.step(KernelAction(code=GOOD))
     assert obs.stage == "correctness" and obs.reward == 0.0
@@ -105,14 +106,37 @@ def test_eval_log_lines(tasks, tmp_path, monkeypatch):
     assert env.state.history[0]["code_sha"] == recs[1]["code_sha"]
 
 
-def test_reference_timing_cached_per_task():
+def test_only_reference_metadata_cached_per_task():
     ev = MockEvaluator([timed(2.0), timed(3.0), timed(1.0)])
     ev.evaluate("ref A", GOOD, "triton", [1])
     ev.evaluate("ref A", GOOD, "triton", [2])
     ev.evaluate("ref B", GOOD, "triton", [3])
     assert ev.calls[0]["ref_cache"] is None
-    assert ev.calls[1]["ref_cache"]["t_ref_ms"] == MockEvaluator.DEFAULT["t_ref_ms"]
+    assert "t_ref_ms" not in ev.calls[1]["ref_cache"]  # Fresh paired timing is never cached.
     assert ev.calls[2]["ref_cache"] is None  # different task
+
+
+def test_worker_request_carries_task_id(monkeypatch):
+    from kernel_env.server.evaluator import Evaluator
+    import kernel_env.server.evaluator as evaluator
+
+    def process(args, **kwargs):
+        # Inspect transport only; do not spawn or execute the candidate.
+        request = json.loads(Path(args[-2]).read_text())
+        assert request["task_id"] == "level1/23_Softmax"
+        Path(args[-1]).write_text(json.dumps({"stage": "correctness", "correct": False}))
+
+        class Completed:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "", ""
+
+        return Completed()
+
+    monkeypatch.setattr(evaluator.subprocess, "Popen", process)
+    result = Evaluator(gpus=["0"])._run("0", "reference", GOOD, "triton", [1], task_id="level1/23_Softmax")
+    assert result["stage"] == "correctness"
 
 
 @pytest.mark.parametrize(
@@ -124,3 +148,24 @@ def test_partial_credit(stage, correct, speedup, reward):
     obs = KernelObservation(stage=stage, correct=correct, speedup=speedup)
     assert kernel_rubric("speedup", partial=True)(None, obs) == pytest.approx(reward)
     assert kernel_rubric("speedup", partial=False)(None, obs) == pytest.approx(reward if correct else 0.0)
+
+
+def test_calibrated_reward_mode_exposes_components_and_timer_provenance(monkeypatch):
+    from kernel_env.server.cuda_graph_timing import METHOD,MEASUREMENT_SCOPE
+    from kernel_env.server.evaluator import MockEvaluator
+    from kernel_env.server.tasks import Task
+    from kernel_env.server.kernel_env_environment import KernelEnvironment
+    from kernel_env.models import KernelAction
+    monkeypatch.setenv('KERNEL_ENV_REWARD','calibrated_speedup_v2')
+    evaluator=MockEvaluator(results=[{'stage':'timed','correct':True,'speedup':2.,'speedup_lower_bound':1.9,
+        'speedup_upper_bound':2.1,'t_ref_ms':.002,'t_new_ms':.001,
+        'timing_method':METHOD,'measurement_scope':MEASUREMENT_SCOPE,
+        'timing_calibration':{'absolute_floor_ms':.00002},'graph_repeats':64}])
+    task=Task('level1/test',1,'class Model: pass')
+    env=KernelEnvironment(evaluator=evaluator,tasks={task.task_id:task},max_turns=3)
+    assert env.reset(task_id=task.task_id).reward_mode=='calibrated_speedup_v2'
+    obs=env.step(KernelAction(code=GOOD))
+    assert obs.reward==pytest.approx(.25+__import__('math').log2(1.9))
+    assert obs.correctness_reward==.25 and obs.performance_reward==pytest.approx(obs.reward-.25)
+    assert obs.rewarded_speedup==1.9 and obs.graph_repeats==64
+    assert obs.timing_calibration['absolute_floor_ms']==.00002

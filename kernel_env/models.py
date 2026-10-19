@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Literal, Optional
 from openenv.core.env_server.types import Action, Observation, State
 from pydantic import Field
 
-Stage = Literal["ready", "format", "compile", "runtime", "timeout", "correctness", "timed"]
+Stage = Literal["ready", "format", "compile", "runtime", "timeout", "correctness", "timed", "infrastructure"]
 
 
 class KernelAction(Action):
@@ -40,9 +40,27 @@ class KernelObservation(Observation):
     feedback: str = Field(default="", description="Truncated error / mismatch / timing summary")
     correct: Optional[bool] = Field(default=None, description="Outputs matched reference")
     max_abs_err: Optional[float] = Field(default=None, description="Worst abs error across trials")
-    speedup: Optional[float] = Field(default=None, description="t_ref / t_new (eager PyTorch ref)")
+    speedup: Optional[float] = Field(default=None, description="t_ref / t_new under the declared timing method")
     t_ref_ms: Optional[float] = Field(default=None, description="Reference runtime, median ms")
     t_new_ms: Optional[float] = Field(default=None, description="Candidate runtime, median ms")
+    timing_samples_ms: List[float] = Field(default_factory=list, description="Independent warmed benchmark medians, ms")
+    generated_cuda_fraction: Optional[float] = None
+    profiling_summary: str = ""
+    ref_timing_samples_ms: List[float] = Field(default_factory=list)
+    speedup_lower_bound: Optional[float] = None
+    speedup_upper_bound: Optional[float] = None
+    timing_method: str = Field(default="", description="Explicit measurement protocol; corrected runs use amortized CUDA graph replay event intervals with unsubtracted launch overhead")
+    measurement_scope: str = ''
+    graph_repeats: Optional[int] = None
+    timing_calibration: Dict[str, Any] = Field(default_factory=dict)
+    replay_profiling_summary: str = ''
+    warmup_evidence: Dict[str, Any] = Field(default_factory=dict)
+    reward_spec: str = ''
+    correctness_reward: Optional[float] = None
+    performance_reward: Optional[float] = None
+    conservative_speedup: Optional[float] = None
+    rewarded_speedup: Optional[float] = None
+    reward_mode: Literal["speedup", "roofline", "paired_speedup", "calibrated_speedup_v2"] = Field(default="speedup", description="Raw environment reward policy")
     t_min_ms: Optional[float] = Field(default=None, description="Roofline floor: max(FLOPs/peak, bytes/bandwidth)")
     bound: Optional[Literal["memory", "compute"]] = Field(default=None, description="Which roof sets t_min_ms")
     arithmetic_intensity: Optional[float] = Field(default=None, description="Counted FLOPs / compulsory bytes")

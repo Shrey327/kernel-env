@@ -64,3 +64,13 @@ def test_prompt_v2_example_is_valid(monkeypatch):
     assert EXAMPLE_V2 in build_prompt(task)
     monkeypatch.setenv("KERNEL_ENV_PROMPT", "1")
     assert EXAMPLE_V2 not in build_prompt(task) and "Reply with the complete module source only" in build_prompt(task)
+
+
+@pytest.mark.parametrize("version", ["1", "2"])
+@pytest.mark.parametrize("task_id", ["level1/23_Softmax", "level1/37_FrobeniusNorm_"])
+def test_normalization_prompt_discloses_extra_validation(monkeypatch, version, task_id):
+    from kernel_env.server.tasks import Task, build_prompt
+
+    monkeypatch.setenv("KERNEL_ENV_PROMPT", version)
+    prompt = build_prompt(Task(task_id, 1, "class Model: ..."))
+    assert "atol=min(configured_atol, max(abs(reference))*1e-5)" in prompt and "signed inputs" in prompt

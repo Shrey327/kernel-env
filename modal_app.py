@@ -65,7 +65,7 @@ def _gpu_count() -> int:
 
 
 def _start_env_server(gpu_ids: str, host: str, reward: str, workers_per_gpu: int, partial_credit: bool,
-                      eval_timeout: float = 300.0):
+                      eval_timeout: float = 300.0, max_turns: int = 4):
     """uvicorn env server on `gpu_ids`; returns (process, eval log path) once /health answers."""
     eval_log = f"/runs/evals-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"  # one JSON line per env reset/step
     proc = subprocess.Popen(
@@ -74,6 +74,7 @@ def _start_env_server(gpu_ids: str, host: str, reward: str, workers_per_gpu: int
              "KERNEL_ENV_EVAL_LOG": eval_log, "KERNEL_ENV_REWARD": reward,
              "KERNEL_ENV_WORKERS_PER_GPU": str(workers_per_gpu),
              "KERNEL_ENV_PARTIAL_CREDIT": "1" if partial_credit else "0",
+             "KERNEL_ENV_MAX_TURNS": str(max_turns),
              "KERNEL_ENV_EVAL_TIMEOUT": str(eval_timeout)},
     )
     local = "http://[::1]:8000" if ":" in host else "http://127.0.0.1:8000"
@@ -120,7 +121,8 @@ def serve():
     volumes={"/runs": runs, "/root/.cache/huggingface": hf_cache},
     secrets=secrets,
 )
-def job(cmd: str, eval_gpus: int = 1, reward: str = "speedup", workers_per_gpu: int = 2, partial_credit: bool = False):
+def job(cmd: str, eval_gpus: int = 1, reward: str = "speedup", workers_per_gpu: int = 2, partial_credit: bool = False,
+        max_turns: int = 4):
     """Run `cmd` in /root/train with an env server on the last `eval_gpus` GPUs ($KERNEL_ENV_URL).
 
     reward: "speedup" or "roofline" (KERNEL_ENV_REWARD, see kernel_env/server/rubrics.py).
@@ -131,7 +133,8 @@ def job(cmd: str, eval_gpus: int = 1, reward: str = "speedup", workers_per_gpu: 
         raise ValueError(f"need 0 < eval_gpus < {n} GPUs; set TRAIN_GPU=<type>:<count>")
     eval_ids = ",".join(map(str, range(n - eval_gpus, n)))
     train_ids = ",".join(map(str, range(n - eval_gpus)))
-    server, eval_log = _start_env_server(eval_ids, "127.0.0.1", reward, workers_per_gpu, partial_credit)
+    server, eval_log = _start_env_server(eval_ids, "127.0.0.1", reward, workers_per_gpu, partial_credit,
+                                       max_turns=max_turns)
     try:
         print(f"env server on GPU(s) {eval_ids} (log {eval_log}); running on GPU(s) {train_ids}: {cmd}", flush=True)
         rc = subprocess.run(

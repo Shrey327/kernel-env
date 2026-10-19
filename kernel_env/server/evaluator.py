@@ -41,7 +41,7 @@ def apply_roofline(res: Dict) -> Dict:
     return res
 
 
-REF_KEYS = ("t_ref_ms", "flops", "bytes", "dtype")
+REF_KEYS = ("flops", "bytes", "dtype")
 
 
 class Evaluator:
@@ -75,7 +75,7 @@ class Evaluator:
         self.atol, self.rtol = atol, rtol
         self.warmup_ms, self.rep_ms = warmup_ms, rep_ms
 
-    def evaluate(self, ref_src: str, code: str, language: str, seeds: List[int]) -> Dict:
+    def evaluate(self, ref_src: str, code: str, language: str, seeds: List[int], task_id: str = "") -> Dict:
         """Result dict also carries gpu_id, queue_wait_s (waiting for a free GPU) and eval_s."""
         t0 = time.monotonic()
         errors = check_source(code, language)
@@ -88,9 +88,9 @@ class Evaluator:
         gpu = self._gpus.get()
         t1 = time.monotonic()
         try:
-            res = self._run(gpu, ref_src, code, language, seeds, cached)
+            res = self._run(gpu, ref_src, code, language, seeds, cached, task_id=task_id)
             if self.workers_per_gpu > 1 and "OutOfMemoryError" in res.get("feedback", ""):
-                res = self._run(gpu, ref_src, code, language, seeds, cached, exclusive=True)
+                res = self._run(gpu, ref_src, code, language, seeds, cached, exclusive=True, task_id=task_id)
         finally:
             self._gpus.put(gpu)
         if cached is None and res.get("t_ref_ms") is not None:
@@ -99,12 +99,12 @@ class Evaluator:
         return apply_roofline({**res, "gpu_id": gpu, "queue_wait_s": t1 - t0, "eval_s": time.monotonic() - t1})
 
     def _run(self, gpu: str, ref_src: str, code: str, language: str, seeds: List[int],
-             ref_cache: Optional[Dict] = None, exclusive: bool = False) -> Dict:
+             ref_cache: Optional[Dict] = None, exclusive: bool = False, task_id: str = "") -> Dict:
         with tempfile.TemporaryDirectory(prefix="kernel_env_") as tmp:
             req, out, code_path = Path(tmp, "request.json"), Path(tmp, "result.json"), Path(tmp, "candidate.py")
             code_path.write_text(code)
             req.write_text(json.dumps({
-                "ref_src": ref_src, "code_path": str(code_path), "language": language, "seeds": seeds,
+                "ref_src": ref_src, "code_path": str(code_path), "language": language, "seeds": seeds, "task_id": task_id,
                 "atol": self.atol, "rtol": self.rtol, "warmup_ms": self.warmup_ms, "rep_ms": self.rep_ms,
                 "ref_cache": ref_cache, "exclusive": exclusive,
                 "gpu_lock": f"{tempfile.gettempdir()}/kernel_env_gpu{gpu}.lock" if self.workers_per_gpu > 1 else None,
@@ -144,8 +144,8 @@ class MockEvaluator(Evaluator):
         self.results = list(results or [])
         self.calls: List[Dict] = []
 
-    def _run(self, gpu, ref_src, code, language, seeds, ref_cache=None, exclusive=False):
-        self.calls.append({"code": code, "language": language, "seeds": seeds, "ref_cache": ref_cache})
+    def _run(self, gpu, ref_src, code, language, seeds, ref_cache=None, exclusive=False, task_id=""):
+        self.calls.append({"code": code, "language": language, "seeds": seeds, "ref_cache": ref_cache, "task_id": task_id})
         return self.results.pop(0) if self.results else dict(self.DEFAULT)
 
 

@@ -24,10 +24,13 @@ def ev():
 def test_good_kernel_is_correct_and_timed(ev):
     res = ev.evaluate(REF, GOOD, "triton", SEEDS)
     assert res["stage"] == "timed" and res["correct"], res
-    assert 0.2 < res["speedup"] < 5.0  # ReLU is memory bound: roughly parity with PyTorch
+    assert res["speedup"] > 0  # Numerical parity/known-fusion controls are separate strict preflight gates.
     assert res["bound"] == "memory" and res["flops"] == 0 and res["bytes"] == 2 * 256 * 16384 * 4
     assert 0.05 < res["roofline_frac"] <= 1.0 and 0.05 < res["ref_roofline_frac"] <= 1.0, res
     assert "Roofline on" in res["feedback"]
+    assert len(res['timing_samples_ms']) == 3
+    assert res['timing_method'] == 'fresh_paired_cuda_graph_event_interval_v4'
+    assert min(res['timing_samples_ms']) <= res['t_new_ms'] <= max(res['timing_samples_ms'])
 
 
 def test_cuda_load_inline_kernel(ev):
@@ -52,8 +55,16 @@ def test_hang_times_out():
 
 def test_reference_vs_itself_is_stable(ev):
     # identical kernel timed repeatedly: speedup spread is the reward noise floor
-    speedups = [ev.evaluate(REF, GOOD, "triton", SEEDS)["speedup"] for _ in range(5)]
+    results = [ev.evaluate(REF, GOOD, "triton", [seed,seed+1,seed+2]) for seed in range(5)]
+    speedups = [r['speedup'] for r in results]
     assert max(speedups) / min(speedups) < 1.15, speedups
+    import sys
+    sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'train'))
+    from reward_noise import noise_aware_returns
+    episodes = [{'task_id':'relu','codes':[GOOD],'turns':[{**r,'reward_mode':'roofline',
+                 'reward':0.3+2.7*min(r['roofline_frac'],1)}]} for r in results]
+    rewards, stats = noise_aware_returns(episodes,5)
+    assert len(set(rewards)) == 1 and stats['learning_return_std'] == 0
 
 
 def test_matmul_roofline_is_compute_bound(ev):
@@ -86,13 +97,18 @@ def test_shared_gpu_keeps_timings_clean():
     assert max(speedups) / min(speedups) < 1.15, speedups
 
 
-def test_very_slow_kernel_skips_benchmark(ev):
+def test_very_slow_kernel_is_correct_and_timed(ev):
     from kernels import SLOW
 
     res = ev.evaluate(REF, SLOW, "triton", SEEDS)
     print(res.get("phases"), res.get("t_new_ms"))
     assert res["stage"] == "timed" and res["correct"] and res["speedup"] < 0.02, res
-    assert "very slow" in res["feedback"]
+    # The wall-time cutoff can fall on either side of this fixture across GPUs.
+    if res['timing_method'] == 'correctness_wall_slow':
+        assert 'very slow' in res['feedback']
+    else:
+        assert res['timing_method'] == 'fresh_paired_cuda_graph_event_interval_v4'
+        assert len(res['timing_samples_ms']) == 3
 
 
 TOY_REF = """
@@ -120,3 +136,33 @@ def test_prompt_v2_example_is_correct(ev):
 
     res = ev.evaluate(TOY_REF, EXAMPLE_V2, "triton", SEEDS)
     assert res["stage"] == "timed" and res["correct"], res
+
+
+@pytest.mark.parametrize('cycles',[100000,20000000])
+def test_nondefault_stream_work_is_rejected(ev,cycles):
+    code = GOOD.replace("super().__init__()", "super().__init__(); self.stream = torch.cuda.Stream()")
+    # Append a delayed side-stream launch after a correct output has been produced.
+    code = code.replace("return y", f"with torch.cuda.stream(self.stream):\n            torch.cuda._sleep({cycles})\n        return y")
+    res = ev.evaluate(REF, code, "triton", SEEDS[:1])
+    assert res['stage']=='format' and res['correct'] is False, res
+    assert 'side-stream' in res['feedback'], res
+
+
+def test_capture_time_side_stream_is_rejected(ev):
+    # Calls 1-8 cover 3 correctness trials, eval+train profiles and the eager warmup; later calls are graph
+    # capture only, so this side stream escapes both eager profiles and the captured replay.
+    code = GOOD.replace("super().__init__()", "super().__init__(); self.stream = torch.cuda.Stream(); self.calls = 0")
+    code = code.replace("return y", "self.calls += 1\n        if self.calls > 8:\n"
+                        "            with torch.cuda.stream(self.stream):\n                torch.cuda._sleep(100000)\n        return y")
+    res = ev.evaluate(REF, code, "triton", SEEDS)
+    assert res['stage']=='format' and res['correct'] is False, res
+    assert 'side-stream' in res['feedback'], res
+
+
+def test_identity_copy_with_unused_jit_kernel_is_rejected(ev):
+    ref = REF.replace("return torch.relu(x)", "return x")
+    code = GOOD.replace("return y", "return x.clone()")
+    # Remove actual kernel invocation, retaining an unused @jit definition.
+    code = "\n".join(line for line in code.splitlines() if "relu_kernel[" not in line)
+    res=ev.evaluate(ref,code,"triton",SEEDS[:1])
+    assert res['stage']=='format' and 'No executed' in res['feedback'], res
