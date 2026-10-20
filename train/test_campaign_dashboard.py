@@ -29,3 +29,20 @@ def test_telemetry_counts_submissions_before_episodes_finish_and_includes_startu
     assert state['kernel_evals']==510 and state['recent_evaluation']['calls']==500
     assert state['recent_evaluation']['queue_wait_s']==4
     assert state['estimated_upper_usd']==14.7
+
+
+def test_serves_ui_shells_publicly_and_unlocks_data_with_cookie(tmp_path):
+    root=tmp_path/'experiment';(root/'seed42').mkdir(parents=True)
+    with TestClient(make_app(root,'test-secret'),base_url='https://testserver') as client:
+        for path in ('/','/methodology','/journey.html','/pilot/','/pilot/journey.html'):
+            response=client.get(path)
+            assert response.status_code==200 and 'text/html' in response.headers['content-type'],path
+        assert 'Kernel Lab' in client.get('/').text
+        for path in ('/state','/pilot/state.json','/pilot/../campaign_dashboard.py','/auth'):
+            assert client.get(path).status_code in (401,404),path
+        assert client.get('/auth',headers={'X-Kernel-Dashboard-Token':'wrong'}).status_code==401
+        login=client.get('/auth',headers={'X-Kernel-Dashboard-Token':'test-secret'})
+        assert login.status_code==204 and 'httponly' in login.headers['set-cookie'].lower()
+        assert client.get('/state').status_code==200
+        assert client.get('/pilot/state.json').status_code==200
+        assert client.get('/pilot/missing.json').status_code==404

@@ -1,0 +1,42 @@
+{
+  "cap_usd": 50,
+  "reported_cost_usd": 3.48551555,
+  "reported_at_utc": "2026-10-19T07:45:19.707670+00:00",
+  "app_ids": [
+    "ap-I76GPtLm1Lj9MedVfamQGh",
+    "ap-T1CWdGU5oTDdqPHnYxA9Iv",
+    "ap-UBo6ir07LyX7uTQD149bNr",
+    "ap-UjTiHn4JRqHOqxYdVsfHPO"
+  ],
+  "charges": [
+    {
+      "Object ID": "ap-I76GPtLm1Lj9MedVfamQGh",
+      "Description": "kernel-env",
+      "Environment": "main",
+      "Interval Start": "2026-10-19T07:00:00",
+      "Cost": "0.04413335"
+    },
+    {
+      "Object ID": "ap-T1CWdGU5oTDdqPHnYxA9Iv",
+      "Description": "kernel-env",
+      "Environment": "main",
+      "Interval Start": "2026-10-19T07:00:00",
+      "Cost": "0.00330519"
+    },
+    {
+      "Object ID": "ap-UBo6ir07LyX7uTQD149bNr",
+      "Description": "kernel-env",
+      "Environment": "main",
+      "Interval Start": "2026-10-19T07:00:00",
+      "Cost": "0.06147975"
+    },
+    {
+      "Object ID": "ap-UjTiHn4JRqHOqxYdVsfHPO",
+      "Description": "kernel-env",
+      "Environment": "main",
+      "Interval Start": "2026-10-19T07:00:00",
+      "Cost": "3.37659726"
+    }
+  ],
+  "note": "Usage reporting can lag; excludes future persistent-storage charges. GPU jobs are stopped."
+}

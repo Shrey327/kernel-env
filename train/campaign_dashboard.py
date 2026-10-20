@@ -1,4 +1,4 @@
-"""Read-only campaign API. The private Sites Worker supplies its secret server-side."""
+"""Read-only campaign API plus the dashboard UI it serves. Pages are public shells; data needs the token."""
 import hmac
 import json
 import threading
@@ -6,9 +6,15 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from dashboard import view
+
+UI=Path(__file__).parent/'dashboard_ui'
+PAGES={'/':'index.html','/methodology':'methodology.html','/methodology.html':'methodology.html',
+       '/journey':'journey.html','/journey.html':'journey.html','/pilot':'pilot/index.html','/pilot/':'pilot/index.html'}
+PILOT={p.name for p in (UI/'pilot').glob('*')}  # fixed allowlist: request paths never reach the filesystem
+COOKIE='kernel_dashboard'
 
 
 def read_json(path, default=None):
@@ -74,10 +80,30 @@ def make_app(root,token,reload_volume=lambda:None):
 
     @app.middleware('http')
     async def authenticate(request:Request,call_next):
-        if request.url.path!='/health' and not hmac.compare_digest(
-                request.headers.get('X-Kernel-Dashboard-Token','').encode(),token.encode()):
+        path=request.url.path
+        public=path=='/health' or path in PAGES or (path.startswith('/pilot/') and path.endswith('.html'))
+        supplied=request.headers.get('X-Kernel-Dashboard-Token') or request.cookies.get(COOKIE,'')
+        if not public and not hmac.compare_digest(supplied.encode(),token.encode()):
             return JSONResponse({'error':'unauthorized'},status_code=401)
         return await call_next(request)
+
+    def page(name):
+        return FileResponse(UI/name,media_type='text/html; charset=utf-8',headers={'Cache-Control':'no-store',
+            'X-Content-Type-Options':'nosniff','Referrer-Policy':'same-origin'})
+    for route,name in PAGES.items():
+        app.add_api_route(route,lambda name=name:page(name),methods=['GET'],include_in_schema=False)
+
+    @app.get('/pilot/{name}')
+    def pilot(name:str):
+        if name not in PILOT:raise HTTPException(404)
+        return page('pilot/'+name) if name.endswith('.html') else FileResponse(UI/'pilot'/name,headers={'Cache-Control':'no-store'})
+
+    @app.get('/auth')
+    def auth():
+        # Reached only past the header check; browsers then send the HttpOnly cookie on pages, fetches and downloads.
+        response=Response(status_code=204)
+        response.set_cookie(COOKIE,token,max_age=7*86400,httponly=True,secure=True,samesite='strict')
+        return response
 
     def seed_path(run):
         nonlocal last_reload

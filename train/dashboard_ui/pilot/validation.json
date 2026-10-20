@@ -1,0 +1,25 @@
+{
+  "seeds": [
+    991,
+    992,
+    993,
+    994,
+    995
+  ],
+  "domain": [
+    -32,
+    32
+  ],
+  "scope": "newly solved pointwise tasks only; original shapes",
+  "results": [
+    {
+      "task_id": "level1/88_MinGPTNewGelu",
+      "turn": 2,
+      "code_sha256": "de157f6100c55aee58af23b85c3dcdc956a5f16755d0d6fc7efb8a25e0a84505",
+      "stage": "timed",
+      "correct": true,
+      "max_abs_err": 0.0004734992980957031,
+      "feedback": "Correct on 5 trials. Reference 1.6214 ms, yours 0.1837 ms, speedup 8.83x on NVIDIA H100 80GB HBM3.\nRoofline on NVIDIA H100 80GB HBM3: memory-bound (arithmetic intensity 0 FLOP/byte), floor 0.1603 ms; PyTorch reaches 10% of it, yours 87%."
+    }
+  ]
+}
